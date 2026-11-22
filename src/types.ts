@@ -1,7 +1,10 @@
 import type { PreviewEnvironmentDO } from "./preview-do";
+import type { EnvRegistryDO } from "./registry-do";
 
 export interface Env {
   PREVIEW_DO: DurableObjectNamespace<PreviewEnvironmentDO>;
+  /** 管理画面の一覧用に、登録された環境を記録する台帳（単一インスタンス） */
+  ENV_REGISTRY: DurableObjectNamespace<EnvRegistryDO>;
   AWS_REGION: string;
   AWS_ACCESS_KEY_ID: string;
   AWS_SECRET_ACCESS_KEY: string;
@@ -23,6 +26,16 @@ export interface Env {
   CF_ACCESS_TEAM_DOMAIN?: string;
   /** 任意: Cloudflare Access アプリケーションの AUD タグ */
   CF_ACCESS_AUD?: string;
+  /** 管理画面（API_HOSTNAME の /admin）を守る Cloudflare Access アプリケーションの AUD タグ */
+  CF_ACCESS_ADMIN_AUD?: string;
+}
+
+/** 台帳に記録する環境（実際の状態は PreviewEnvironmentDO.getStatus で取得する） */
+export interface RegistryEntry {
+  envId: string;
+  imageIdentifier: string;
+  registeredAt: number; // epoch ms
+  updatedAt: number; // epoch ms
 }
 
 export type MicroVmLifecycleState =
