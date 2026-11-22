@@ -2,6 +2,8 @@
 # 本番環境では `wrangler secret put <NAME>` を使用してください
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+# 任意: 一時的な認証情報（`aws configure export-credentials` など）を使う場合のセッショントークン
+# AWS_SESSION_TOKEN=
 CI_WEBHOOK_SECRET=replace-with-random-secret
 
 # 任意: Cloudflare Access JWT 検証を有効にする場合

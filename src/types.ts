@@ -5,6 +5,8 @@ export interface Env {
   AWS_REGION: string;
   AWS_ACCESS_KEY_ID: string;
   AWS_SECRET_ACCESS_KEY: string;
+  /** 任意: 一時的な認証情報（STS）を使う場合のセッショントークン */
+  AWS_SESSION_TOKEN?: string;
   APP_TARGET_PORT: string;
   CI_WEBHOOK_SECRET: string;
   PREVIEW_BASE_DOMAIN?: string;

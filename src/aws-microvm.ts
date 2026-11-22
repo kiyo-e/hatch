@@ -58,10 +58,14 @@ export class AwsMicroVmClient implements MicroVmClient {
   private readonly signer: AwsClient;
   private readonly baseUrl: string;
 
-  constructor(env: Pick<Env, "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_REGION">) {
+  constructor(
+    env: Pick<Env, "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN" | "AWS_REGION">
+  ) {
     this.signer = new AwsClient({
       accessKeyId: env.AWS_ACCESS_KEY_ID,
       secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      // 一時的な認証情報（STS / aws configure export-credentials）を使う場合のみ設定
+      sessionToken: env.AWS_SESSION_TOKEN || undefined,
       region: env.AWS_REGION,
       service: "lambda",
     });
