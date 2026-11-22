@@ -27,10 +27,24 @@ export class NoImageRegisteredError extends Error {
   }
 }
 
+/**
+ * RunMicrovm の完了までの間に再登録・破棄が行われ、起動結果が古くなったことを示す。
+ */
+export class StaleBootError extends Error {
+  constructor() {
+    super("Preview environment was re-registered or destroyed while the MicroVM was booting.");
+    this.name = "StaleBootError";
+  }
+}
+
+// 起動中に再登録が続いた場合に起動をやり直す最大回数
+const MAX_BOOT_ATTEMPTS = 3;
+
 export class PreviewEnvironmentDO extends DurableObject<Env> {
   private readonly aws: MicroVmClient;
   private bootPromise: Promise<ActiveVmState> | null = null;
   private cachedToken: CachedJweToken | null = null;
+  private tokenPromise: { microvmId: string; promise: Promise<string> } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env, awsClient?: MicroVmClient) {
     super(ctx, env);
@@ -47,12 +61,13 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       await this.aws.terminateMicroVm(current.microvmId).catch(() => {});
     }
 
-    this.cachedToken = null;
-    this.bootPromise = null;
+    // 起動中の bootPromise は破棄する（完了時に generation 不一致を検出して自ら VM を終了する）
+    this.resetInMemoryState();
 
     const nextState: PersistedVmState = {
       imageIdentifier,
       imageVersion,
+      generation: crypto.randomUUID(),
       updatedAt: Date.now(),
     };
     await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
@@ -70,8 +85,7 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     if (current?.imageIdentifier) {
       await this.aws.deleteMicroVmImage(current.imageIdentifier).catch(() => {});
     }
-    this.cachedToken = null;
-    this.bootPromise = null;
+    this.resetInMemoryState();
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
   }
@@ -123,8 +137,7 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       this.env.COLD_START_LOADING_PAGE === "true" &&
       acceptsHtmlBrowserRequest(request)
     ) {
-      const boot = this.startOrJoinBoot(state);
-      this.ctx.waitUntil(boot.catch(() => {}));
+      this.ctx.waitUntil(this.ensureRunningMicroVm().catch(() => {}));
       const hostLabel = new URL(request.url).hostname;
       return renderColdStartResponse(hostLabel, 3);
     }
@@ -184,25 +197,45 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
    * 稼働中の MicroVM を保証する（未起動 or 7h45m 超過なら排他ロック付きで RunMicrovm）。
    */
   private async ensureRunningMicroVm(): Promise<ActiveVmState> {
-    const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-    if (!state?.imageIdentifier) {
-      throw new NoImageRegisteredError();
-    }
+    for (let attempt = 1; ; attempt++) {
+      const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+      if (!state?.imageIdentifier) {
+        throw new NoImageRegisteredError();
+      }
 
-    if (this.isVmAlive(state)) {
-      return state;
-    }
+      if (this.isVmAlive(state)) {
+        return state;
+      }
 
-    return this.startOrJoinBoot(state);
+      try {
+        return await this.startOrJoinBoot(state);
+      } catch (err) {
+        // 起動中に再登録された場合は最新の登録内容で起動し直す（破棄済みなら次ループで 404）
+        if (err instanceof StaleBootError && attempt < MAX_BOOT_ATTEMPTS) {
+          continue;
+        }
+        throw err;
+      }
+    }
   }
 
   private startOrJoinBoot(state: PersistedVmState): Promise<ActiveVmState> {
     if (!this.bootPromise) {
-      this.bootPromise = this.provisionNewMicroVm(state).finally(() => {
-        this.bootPromise = null;
+      const boot: Promise<ActiveVmState> = this.provisionNewMicroVm(state).finally(() => {
+        // registerImage / destroy 後に始まった別の起動のロックを解放しないよう、自分自身の場合のみ解除
+        if (this.bootPromise === boot) {
+          this.bootPromise = null;
+        }
       });
+      this.bootPromise = boot;
     }
     return this.bootPromise;
+  }
+
+  private resetInMemoryState(): void {
+    this.cachedToken = null;
+    this.tokenPromise = null;
+    this.bootPromise = null;
   }
 
   private async provisionNewMicroVm(state: PersistedVmState): Promise<ActiveVmState> {
@@ -228,10 +261,24 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       egressNetworkConnectors: egressConnectors,
     });
 
+    // RunMicrovm 待ちの間に registerImage / destroy が走っていたら、起動結果を書き戻さずに VM を終了する
+    // （get → put の間に外部 I/O を挟まないため、DO の入力ゲートにより他のイベントは割り込まない）
+    const latest = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+    if (
+      !latest?.imageIdentifier ||
+      latest.generation !== state.generation ||
+      latest.imageIdentifier !== state.imageIdentifier ||
+      latest.imageVersion !== state.imageVersion
+    ) {
+      this.ctx.waitUntil(this.aws.terminateMicroVm(started.microvmId).catch(() => {}));
+      throw new StaleBootError();
+    }
+
     const now = Date.now();
     const nextState: ActiveVmState = {
       imageIdentifier: state.imageIdentifier,
       imageVersion: state.imageVersion,
+      generation: state.generation,
       microvmId: started.microvmId,
       endpointUrl: started.endpointUrl,
       createdAt: now,
@@ -245,10 +292,12 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   private async invalidateVmInstance(): Promise<void> {
     const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
     this.cachedToken = null;
+    this.tokenPromise = null;
     if (state?.imageIdentifier) {
       await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, {
         imageIdentifier: state.imageIdentifier,
         imageVersion: state.imageVersion,
+        generation: state.generation,
         updatedAt: Date.now(),
       });
     }
@@ -257,23 +306,46 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   /**
    * JWE 認証トークンのインメモリキャッシュと期限 60 秒前リフレッシュ。
    */
-  private async getValidJweToken(microvmId: string): Promise<string> {
-    const now = Date.now();
-    if (this.cachedToken && now < this.cachedToken.expiresAt - TOKEN_REFRESH_BUFFER_MS) {
-      return this.cachedToken.token;
+  private getValidJweToken(microvmId: string): Promise<string> {
+    const cached = this.cachedToken;
+    if (
+      cached &&
+      cached.microvmId === microvmId &&
+      Date.now() < cached.expiresAt - TOKEN_REFRESH_BUFFER_MS
+    ) {
+      return Promise.resolve(cached.token);
     }
 
-    const targetPort = this.getTargetPort();
+    // 同時リクエストでトークンを重複発行しないよう、発行中の Promise に相乗りする
+    if (this.tokenPromise?.microvmId === microvmId) {
+      return this.tokenPromise.promise;
+    }
+
+    const promise: Promise<string> = this.issueJweToken(microvmId).finally(() => {
+      if (this.tokenPromise?.promise === promise) {
+        this.tokenPromise = null;
+      }
+    });
+    this.tokenPromise = { microvmId, promise };
+    return promise;
+  }
+
+  private async issueJweToken(microvmId: string): Promise<string> {
+    const issuedAt = Date.now();
     const issued = await this.aws.createMicroVmAuthToken({
       microvmId,
       expirationInMinutes: TOKEN_DURATION_MINUTES,
-      allowedPort: targetPort,
+      allowedPort: this.getTargetPort(),
     });
 
-    this.cachedToken = {
-      token: issued.token,
-      expiresAt: now + issued.expirationInMinutes * 60 * 1000,
-    };
+    // 発行中に cachedToken が無効化（403 リトライ・再登録等）されていても、この VM 用のトークンとしては有効
+    if (this.tokenPromise?.microvmId === microvmId) {
+      this.cachedToken = {
+        microvmId,
+        token: issued.token,
+        expiresAt: issuedAt + issued.expirationInMinutes * 60 * 1000,
+      };
+    }
     return issued.token;
   }
 

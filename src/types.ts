@@ -36,6 +36,8 @@ export type MicroVmLifecycleState =
 export interface PersistedVmState {
   imageIdentifier: string;
   imageVersion?: string;
+  /** registerImage ごとに更新される世代 ID（起動中の再登録・破棄の検出に使用） */
+  generation?: string;
   microvmId?: string;
   endpointUrl?: string;
   createdAt?: number; // epoch ms
@@ -45,6 +47,7 @@ export interface PersistedVmState {
 export interface ActiveVmState {
   imageIdentifier: string;
   imageVersion?: string;
+  generation?: string;
   microvmId: string;
   endpointUrl: string;
   createdAt: number;
@@ -52,6 +55,7 @@ export interface ActiveVmState {
 }
 
 export interface CachedJweToken {
+  microvmId: string;
   token: string;
   expiresAt: number; // epoch ms
 }
