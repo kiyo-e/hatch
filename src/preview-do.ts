@@ -128,36 +128,63 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
         ? this.imageDeletionInFlight.promise
         : null;
     // 直列キューに並ぶ前に削除待ちから外す（キューの先で実行中のクリーンアップも、このイメージは消さない）
-    await this.removeFromPendingCleanup({ microvmIds: [], imageIdentifiers: [imageIdentifier] });
+    const wasPending = await this.removeFromPendingCleanup({
+      microvmIds: [],
+      imageIdentifiers: [imageIdentifier],
+    });
 
     return this.exclusive(async () => {
-      // 送信済みだった削除が成功していたら、存在しないイメージを登録しないよう拒否する
-      if (deletion && (await deletion.then(() => true, () => false))) {
-        throw new ImageDeletedDuringCleanupError(imageIdentifier);
-      }
-
-      const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-
-      // 起動中の bootPromise は破棄する（完了時に generation 不一致を検出して自ら VM を終了する）
-      this.resetInMemoryState();
-
-      const now = Date.now();
-      const nextState: PersistedVmState = {
-        imageIdentifier,
-        imageVersion,
-        generation: crypto.randomUUID(),
-        zombieAt: now + this.getZombieTtlMs(),
-        updatedAt: now,
-      };
-      // 旧 MicroVM は先に削除待ちとして永続化してから終了する（終了に失敗しても Alarm で再試行される）
-      await this.enqueueCleanup({ microvmIds: current?.microvmId ? [current.microvmId] : [], imageIdentifiers: [] });
-      await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
-      await this.scheduleNextAlarm();
-
-      if (current?.microvmId) {
-        await this.processCleanupQueueLocked({ microvmIds: [current.microvmId], imageIdentifiers: [] });
+      try {
+        await this.registerImageLocked(imageIdentifier, imageVersion, deletion);
+      } catch (err) {
+        // 登録に失敗したら、外した削除待ちを元に戻す（登録も削除もされないイメージを残さない）
+        if (wasPending && !(err instanceof ImageDeletedDuringCleanupError)) {
+          const registered = await this.ctx.storage
+            .get<PersistedVmState>(STORAGE_KEY_STATE)
+            .catch(() => undefined);
+          if (registered?.imageIdentifier !== imageIdentifier) {
+            await this.enqueueCleanup({ microvmIds: [], imageIdentifiers: [imageIdentifier] }).catch(
+              (restoreErr) =>
+                console.error(`[preview-do] failed to restore pending cleanup for ${imageIdentifier}:`, restoreErr)
+            );
+          }
+        }
+        throw err;
       }
     });
+  }
+
+  private async registerImageLocked(
+    imageIdentifier: string,
+    imageVersion: string | undefined,
+    deletion: Promise<void> | null
+  ): Promise<void> {
+    // 送信済みだった削除が成功していたら、存在しないイメージを登録しないよう拒否する
+    if (deletion && (await deletion.then(() => true, () => false))) {
+      throw new ImageDeletedDuringCleanupError(imageIdentifier);
+    }
+
+    const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+
+    // 起動中の bootPromise は破棄する（完了時に generation 不一致を検出して自ら VM を終了する）
+    this.resetInMemoryState();
+
+    const now = Date.now();
+    const nextState: PersistedVmState = {
+      imageIdentifier,
+      imageVersion,
+      generation: crypto.randomUUID(),
+      zombieAt: now + this.getZombieTtlMs(),
+      updatedAt: now,
+    };
+    // 旧 MicroVM は先に削除待ちとして永続化してから終了する（終了に失敗しても Alarm で再試行される）
+    await this.enqueueCleanup({ microvmIds: current?.microvmId ? [current.microvmId] : [], imageIdentifiers: [] });
+    await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
+    await this.scheduleNextAlarm();
+
+    if (current?.microvmId) {
+      await this.processCleanupQueueLocked({ microvmIds: [current.microvmId], imageIdentifiers: [] });
+    }
   }
 
   /**
@@ -623,14 +650,18 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   /**
    * 削除待ちから対象を外す。処理中に他の操作が追加した対象は残す。
    */
-  private async removeFromPendingCleanup(targets: CleanupTargets, nextRetryAt?: number): Promise<void> {
+  private async removeFromPendingCleanup(targets: CleanupTargets, nextRetryAt?: number): Promise<boolean> {
     const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
-    if (!pending) return;
+    if (!pending) return false;
+    const removed =
+      pending.microvmIds.some((id) => targets.microvmIds.includes(id)) ||
+      pending.imageIdentifiers.some((id) => targets.imageIdentifiers.includes(id));
     await this.savePendingCleanup({
       microvmIds: pending.microvmIds.filter((id) => !targets.microvmIds.includes(id)),
       imageIdentifiers: pending.imageIdentifiers.filter((id) => !targets.imageIdentifiers.includes(id)),
       retryAt: nextRetryAt ?? pending.retryAt,
     });
+    return removed;
   }
 
   /**

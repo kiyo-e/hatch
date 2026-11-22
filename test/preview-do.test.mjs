@@ -521,6 +521,20 @@ test("destroy が重なっても、先に失敗した削除対象を後続が消
   assert.ok(ctx.alarm);
 });
 
+test("削除待ちのイメージの再登録が失敗したら、削除待ちに戻す", async () => {
+  const { dObj, ctx } = setup();
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
+  const put = ctx.storage.put;
+  ctx.storage.put = async (key, value) => {
+    if (key === "state") throw new Error("storage unavailable");
+    return put(key, value);
+  };
+
+  await assert.rejects(dObj.registerImage("img-a"), /storage unavailable/);
+  assert.deepEqual(ctx.data.get("pendingCleanup").imageIdentifiers, ["img-a"]);
+  assert.ok(ctx.alarm, "再試行の Alarm が設定されている");
+});
+
 test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
