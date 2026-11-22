@@ -102,7 +102,8 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   private cachedToken: CachedJweToken | null = null;
   private tokenPromise: { microvmId: string; promise: Promise<string> } | null = null;
   private lastForcedTokenRefresh: { microvmId: string; at: number } | null = null;
-  private cleanupInFlight: Promise<void> | null = null;
+  /** 登録・破棄・削除の再試行を直列に実行するためのキュー */
+  private exclusiveChain: Promise<void> = Promise.resolve();
   /** AWS に送信済みで完了待ちのイメージ削除 */
   private imageDeletionInFlight: { imageIdentifier: string; promise: Promise<void> } | null = null;
   private vmStateCheck: {
@@ -121,65 +122,66 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
    * 同時にゾンビイメージ掃除用の DO Alarm を設定する。
    */
   async registerImage(imageIdentifier: string, imageVersion?: string): Promise<void> {
-    // 同じイメージの削除が AWS に送信済みなら結果を待つ。削除が成功していたら、存在しないイメージを
-    // 登録しないよう拒否する（まだ送信していない削除は、クリーンアップ側が登録済みを確認してスキップする）
-    const deletion = this.imageDeletionInFlight;
-    if (deletion?.imageIdentifier === imageIdentifier) {
-      const deleted = await deletion.promise.then(
-        () => true,
-        () => false
-      );
-      if (deleted) {
+    // 同じイメージの削除が AWS に送信済みなら、その結果を後で確認する
+    const deletion =
+      this.imageDeletionInFlight?.imageIdentifier === imageIdentifier
+        ? this.imageDeletionInFlight.promise
+        : null;
+    // 直列キューに並ぶ前に削除待ちから外す（キューの先で実行中のクリーンアップも、このイメージは消さない）
+    await this.removeFromPendingCleanup({ microvmIds: [], imageIdentifiers: [imageIdentifier] });
+
+    return this.exclusive(async () => {
+      // 送信済みだった削除が成功していたら、存在しないイメージを登録しないよう拒否する
+      if (deletion && (await deletion.then(() => true, () => false))) {
         throw new ImageDeletedDuringCleanupError(imageIdentifier);
       }
-    }
 
-    const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-    if (current?.microvmId) {
-      await this.aws.terminateMicroVm(current.microvmId).catch(() => {});
-    }
+      const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
 
-    // 起動中の bootPromise は破棄する（完了時に generation 不一致を検出して自ら VM を終了する）
-    this.resetInMemoryState();
+      // 起動中の bootPromise は破棄する（完了時に generation 不一致を検出して自ら VM を終了する）
+      this.resetInMemoryState();
 
-    const now = Date.now();
-    const nextState: PersistedVmState = {
-      imageIdentifier,
-      imageVersion,
-      generation: crypto.randomUUID(),
-      zombieAt: now + this.getZombieTtlMs(),
-      updatedAt: now,
-    };
-    await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
+      const now = Date.now();
+      const nextState: PersistedVmState = {
+        imageIdentifier,
+        imageVersion,
+        generation: crypto.randomUUID(),
+        zombieAt: now + this.getZombieTtlMs(),
+        updatedAt: now,
+      };
+      // 旧 MicroVM は先に削除待ちとして永続化してから終了する（終了に失敗しても Alarm で再試行される）
+      await this.enqueueCleanup({ microvmIds: current?.microvmId ? [current.microvmId] : [], imageIdentifiers: [] });
+      await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
+      await this.scheduleNextAlarm();
 
-    // 削除待ちのイメージと同じものが再登録された場合は削除対象から外す
-    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
-    if (pending?.imageIdentifiers.includes(imageIdentifier)) {
-      await this.savePendingCleanup({
-        ...pending,
-        imageIdentifiers: pending.imageIdentifiers.filter((id) => id !== imageIdentifier),
-      });
-    }
-
-    await this.scheduleNextAlarm();
+      if (current?.microvmId) {
+        await this.processCleanupQueueLocked({ microvmIds: [current.microvmId], imageIdentifiers: [] });
+      }
+    });
   }
 
   /**
    * PR クローズ時または DO Alarm 発火時の完全クリーンアップ。
-   * MicroVM の終了・イメージ削除に失敗した場合は削除待ちとして記録し、Alarm で再試行したうえで
+   * MicroVM の終了・イメージ削除に失敗した場合は削除待ちとして Alarm で再試行し、
    * CleanupIncompleteError を投げる（呼び出し元の CI が失敗として検知できるようにする）。
    */
   async destroy(): Promise<void> {
-    const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    return this.exclusive(async () => {
+      const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
 
-    // 先に状態を消し、AWS 呼び出し中に来たアクセスで再起動されないようにする
-    this.resetInMemoryState();
-    await this.ctx.storage.delete(STORAGE_KEY_STATE);
+      // 削除対象を先に永続化してから状態を消す（書き込みに失敗しても対象を見失わない）
+      await this.enqueueCleanup({
+        microvmIds: current?.microvmId ? [current.microvmId] : [],
+        imageIdentifiers: current?.imageIdentifier ? [current.imageIdentifier] : [],
+      });
+      // 状態を消し、AWS 呼び出し中に来たアクセスで再起動されないようにする
+      this.resetInMemoryState();
+      await this.ctx.storage.delete(STORAGE_KEY_STATE);
 
-    await this.runCleanup({
-      microvmIds: uniq([current?.microvmId, ...(pending?.microvmIds ?? [])]),
-      imageIdentifiers: uniq([current?.imageIdentifier, ...(pending?.imageIdentifiers ?? [])]),
+      const remaining = await this.processCleanupQueueLocked();
+      if (remaining) {
+        throw new CleanupIncompleteError(remaining);
+      }
     });
   }
 
@@ -197,14 +199,12 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
         return;
       }
 
-      const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
-      if (pending) {
-        await this.runCleanup(pending);
-      } else {
-        await this.scheduleNextAlarm();
+      const remaining = await this.exclusive(() => this.processCleanupQueueLocked());
+      if (remaining) {
+        console.error("[preview-do] alarm cleanup incomplete; will retry:", remaining);
       }
     } catch (err) {
-      // CleanupIncompleteError は失敗分を削除待ちとして記録し、次の Alarm を設定済み。
+      // CleanupIncompleteError は失敗分が削除待ちとして永続化され、次の Alarm も設定済み。
       // それ以外（ストレージ障害等）は再設定できていないため、再送出してプラットフォームの自動リトライに任せる
       if (err instanceof CleanupIncompleteError) {
         console.error("[preview-do] alarm cleanup incomplete:", err);
@@ -449,7 +449,13 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       latest.imageIdentifier !== state.imageIdentifier ||
       latest.imageVersion !== state.imageVersion
     ) {
-      this.ctx.waitUntil(this.aws.terminateMicroVm(started.microvmId).catch(() => {}));
+      // 終了に失敗しても見失わないよう、削除待ちとして永続化してから終了する
+      await this.enqueueCleanup({ microvmIds: [started.microvmId], imageIdentifiers: [] });
+      this.ctx.waitUntil(
+        this.exclusive(() =>
+          this.processCleanupQueueLocked({ microvmIds: [started.microvmId], imageIdentifiers: [] })
+        ).catch((err) => console.error("[preview-do] stale MicroVM cleanup failed:", err))
+      );
       throw new StaleBootError();
     }
 
@@ -589,61 +595,89 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   }
 
   /**
-   * MicroVM の終了とイメージの削除を行い、失敗分は削除待ちとして記録して Alarm で再試行する。
+   * 登録・破棄・削除の再試行を直列に実行する。fn の中から exclusive を呼ばないこと（デッドロックする）。
    */
-  private runCleanup(targets: Omit<PendingCleanup, "retryAt">): Promise<void> {
-    // 実行中のクリーンアップの後ろに直列につなぐ（自分自身を待たないよう、直前の Promise だけを待つ）
-    const previous = this.cleanupInFlight ?? Promise.resolve();
-    const run: Promise<void> = previous
-      .catch(() => {})
-      .then(() => this.doCleanup(targets))
-      .finally(() => {
-        if (this.cleanupInFlight === run) this.cleanupInFlight = null;
-      });
-    this.cleanupInFlight = run;
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.exclusiveChain.then(fn);
+    this.exclusiveChain = run.then(
+      () => {},
+      () => {}
+    );
     return run;
   }
 
-  private async doCleanup(targets: Omit<PendingCleanup, "retryAt">): Promise<void> {
-    const failed: Omit<PendingCleanup, "retryAt"> = { microvmIds: [], imageIdentifiers: [] };
+  /**
+   * 削除待ちに対象を追加する（外部 I/O を挟まない読み書きなので、他のイベントと交錯しない）。
+   */
+  private async enqueueCleanup(targets: CleanupTargets): Promise<void> {
+    if (targets.microvmIds.length === 0 && targets.imageIdentifiers.length === 0) return;
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    await this.savePendingCleanup({
+      microvmIds: uniq([...(pending?.microvmIds ?? []), ...targets.microvmIds]),
+      imageIdentifiers: uniq([...(pending?.imageIdentifiers ?? []), ...targets.imageIdentifiers]),
+      retryAt: pending?.retryAt ?? Date.now() + CLEANUP_RETRY_DELAY_MS,
+    });
+    await this.scheduleNextAlarm();
+  }
 
-    for (const id of targets.microvmIds) {
+  /**
+   * 削除待ちから対象を外す。処理中に他の操作が追加した対象は残す。
+   */
+  private async removeFromPendingCleanup(targets: CleanupTargets, nextRetryAt?: number): Promise<void> {
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    if (!pending) return;
+    await this.savePendingCleanup({
+      microvmIds: pending.microvmIds.filter((id) => !targets.microvmIds.includes(id)),
+      imageIdentifiers: pending.imageIdentifiers.filter((id) => !targets.imageIdentifiers.includes(id)),
+      retryAt: nextRetryAt ?? pending.retryAt,
+    });
+  }
+
+  /**
+   * 削除待ちの MicroVM 終了・イメージ削除を実行し、成功した分を削除待ちから外す（exclusive の中で呼ぶ）。
+   * only を指定した場合はその対象だけを処理する。削除しきれなかった対象を返す（なければ null）。
+   */
+  private async processCleanupQueueLocked(only?: CleanupTargets): Promise<PendingCleanup | null> {
+    // キューで実際に処理を始める時点の内容を読む（並んでいる間に追加された対象も含める）
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    const done: CleanupTargets = { microvmIds: [], imageIdentifiers: [] };
+    const microvmIds = (pending?.microvmIds ?? []).filter((id) => !only || only.microvmIds.includes(id));
+    const imageIdentifiers = (pending?.imageIdentifiers ?? []).filter(
+      (id) => !only || only.imageIdentifiers.includes(id)
+    );
+
+    for (const id of microvmIds) {
       try {
         await this.aws.terminateMicroVm(id);
+        done.microvmIds.push(id);
       } catch (err) {
         console.error(`[preview-do] TerminateMicrovm(${id}) failed:`, err);
-        failed.microvmIds.push(id);
       }
     }
-    for (const id of targets.imageIdentifiers) {
-      // 削除待ちに入った後で同じイメージが再登録されていたら消さない
+    for (const id of imageIdentifiers) {
+      // 直前に削除待ちから外された（再登録された）イメージは消さない
+      const latest = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+      if (!latest?.imageIdentifiers.includes(id)) continue;
       const registered = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-      if (registered?.imageIdentifier === id) continue;
+      if (registered?.imageIdentifier === id) {
+        done.imageIdentifiers.push(id);
+        continue;
+      }
       const promise = this.aws.deleteMicroVmImage(id);
       this.imageDeletionInFlight = { imageIdentifier: id, promise };
       try {
         await promise;
+        done.imageIdentifiers.push(id);
       } catch (err) {
         console.error(`[preview-do] DeleteMicrovmImage(${id}) failed:`, err);
-        failed.imageIdentifiers.push(id);
       } finally {
         if (this.imageDeletionInFlight?.promise === promise) this.imageDeletionInFlight = null;
       }
     }
 
-    // 処理中に同じイメージが再登録されていたら、そのイメージは消さずに残す
-    const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-    if (current?.imageIdentifier) {
-      failed.imageIdentifiers = failed.imageIdentifiers.filter((id) => id !== current.imageIdentifier);
-    }
-
-    const pending: PendingCleanup = { ...failed, retryAt: Date.now() + CLEANUP_RETRY_DELAY_MS };
-    await this.savePendingCleanup(pending);
+    await this.removeFromPendingCleanup(done, Date.now() + CLEANUP_RETRY_DELAY_MS);
     await this.scheduleNextAlarm();
-
-    if (pending.microvmIds.length > 0 || pending.imageIdentifiers.length > 0) {
-      throw new CleanupIncompleteError(pending);
-    }
+    return (await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP)) ?? null;
   }
 
   private async savePendingCleanup(pending: PendingCleanup): Promise<void> {
@@ -705,6 +739,8 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     return fetch(proxyReq);
   }
 }
+
+type CleanupTargets = Omit<PendingCleanup, "retryAt">;
 
 function uniq(values: Array<string | undefined>): string[] {
   return [...new Set(values.filter((v): v is string => Boolean(v)))];
