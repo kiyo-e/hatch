@@ -35,6 +35,10 @@ export const TOKEN_FORCE_REFRESH_INTERVAL_MS = 30 * 1000;
 export const VM_STATE_CHECK_INTERVAL_MS = 30 * 1000;
 // 破棄に失敗した MicroVM / イメージの再削除間隔
 export const CLEANUP_RETRY_DELAY_MS = 10 * 60 * 1000;
+// TerminateMicrovm は非同期に進み、終了しきるまでイメージを削除できない
+// （"Cannot delete microvm image with running microvms."）。イメージ削除の前に終了を待つ上限と確認間隔
+export const TERMINATION_WAIT_TIMEOUT_MS = 30 * 1000;
+export const TERMINATION_POLL_INTERVAL_MS = 2 * 1000;
 
 export class NoImageRegisteredError extends Error {
   constructor() {
@@ -114,9 +118,19 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     promise: Promise<MicroVmLifecycleState>;
   } | null = null;
 
-  constructor(ctx: DurableObjectState, env: Env, awsClient?: MicroVmClient) {
+  private readonly terminationWaitTimeoutMs: number;
+  private readonly terminationPollIntervalMs: number;
+
+  constructor(
+    ctx: DurableObjectState,
+    env: Env,
+    awsClient?: MicroVmClient,
+    options: { terminationWaitTimeoutMs?: number; terminationPollIntervalMs?: number } = {}
+  ) {
     super(ctx, env);
     this.aws = awsClient ?? new AwsMicroVmClient(env);
+    this.terminationWaitTimeoutMs = options.terminationWaitTimeoutMs ?? TERMINATION_WAIT_TIMEOUT_MS;
+    this.terminationPollIntervalMs = options.terminationPollIntervalMs ?? TERMINATION_POLL_INTERVAL_MS;
   }
 
   /**
@@ -313,7 +327,13 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       if (backoffSeconds > 0) {
         return renderBootFailedResponse(hostLabel, backoffSeconds);
       }
-      this.ctx.waitUntil(this.ensureRunningMicroVm().catch(() => {}));
+      this.ctx.waitUntil(
+        this.ensureRunningMicroVm().catch((err) => {
+          // 再登録・破棄で起動が不要になった場合は失敗ではない。それ以外は原因が分かるようログに残す
+          if (err instanceof StaleBootError || err instanceof NoImageRegisteredError) return;
+          console.error(`[preview-do] ${hostLabel}: background boot failed:`, err);
+        })
+      );
       return renderColdStartResponse(hostLabel, 3);
     }
 
@@ -732,6 +752,10 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
         console.error(`[preview-do] TerminateMicrovm(${id}) failed:`, err);
       }
     }
+    // 終了させたばかりの MicroVM が残っているとイメージを削除できないため、終了しきるまで待つ
+    if (imageIdentifiers.length > 0) {
+      await this.waitForTermination(done.microvmIds);
+    }
     for (const id of imageIdentifiers) {
       // 直前に削除待ちから外された（再登録された）イメージは消さない
       const latest = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
@@ -775,6 +799,27 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     return failed.microvmIds.length > 0 || failed.imageIdentifiers.length > 0 || failed.destroyState
       ? failed
       : null;
+  }
+
+  /**
+   * MicroVM が TERMINATED / NOT_FOUND になるまで待つ（上限 terminationWaitTimeoutMs）。
+   * 上限を過ぎても例外にはせず、続くイメージ削除の失敗は削除待ちとして Alarm で再試行される。
+   */
+  private async waitForTermination(microvmIds: string[]): Promise<void> {
+    let waiting = [...microvmIds];
+    const deadline = Date.now() + this.terminationWaitTimeoutMs;
+    while (waiting.length > 0) {
+      const states = await Promise.all(
+        waiting.map((id) => this.aws.getMicroVmState(id).catch(() => "UNKNOWN" as const))
+      );
+      waiting = waiting.filter((_, i) => states[i] !== "TERMINATED" && states[i] !== "NOT_FOUND");
+      if (waiting.length === 0) return;
+      if (Date.now() + this.terminationPollIntervalMs > deadline) {
+        console.error(`[preview-do] MicroVMs still terminating after ${this.terminationWaitTimeoutMs}ms:`, waiting);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.terminationPollIntervalMs));
+    }
   }
 
   private async savePendingCleanup(pending: PendingCleanup): Promise<void> {
