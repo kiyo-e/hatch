@@ -47,10 +47,17 @@ async function loadEnvs(env: Env): Promise<EnvRow[]> {
   });
 }
 
-function previewUrl(requestUrl: string, envId: string, env: Env): string {
+export function previewUrl(
+  requestUrl: string,
+  envId: string,
+  env: Pick<Env, "PREVIEW_BASE_DOMAIN">
+): string {
   const url = new URL(requestUrl);
   const base = env.PREVIEW_BASE_DOMAIN || "preview.example.com";
-  return `${url.protocol}//${envId}.${base}${url.port ? `:${url.port}` : ""}/`;
+  // 本番のプレビューは常に https。wrangler dev（*.localhost）は http で開くが、upstream_protocol: https により
+  // Worker から見た URL は https になるため、リクエストのスキームではなくホスト名で決める
+  const local = url.hostname === "localhost" || url.hostname.endsWith(".localhost");
+  return `${local ? "http" : "https"}://${envId}.${base}${local && url.port ? `:${url.port}` : ""}/`;
 }
 
 /** 値が無いときの表示（どの欄でも同じ見た目にする） */
