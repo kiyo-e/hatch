@@ -74,17 +74,21 @@ test("aud が文字列でも完全一致で比較する（部分一致で通さ�
   assert.equal((await verify(await sign(k1, { aud: `x-${AUD}-x` }))).status, 403);
 });
 
-test("鍵ローテーション直後の未知の kid は JWKS を再取得して検証する", async () => {
+test("鍵ローテーション直後の未知の kid は、同時リクエストも含め 1 回の JWKS 再取得で検証する", async () => {
   await verify(await sign(k1)); // k1 だけの JWKS をキャッシュ
   publishedKeys = [k1, k2];
   const before = jwksFetches;
-  assert.deepEqual(await verify(await sign(k2)), { ok: true });
+  const tokens = await Promise.all(Array.from({ length: 5 }, () => sign(k2)));
+  const results = await Promise.all(tokens.map((t) => verify(t)));
+  assert.deepEqual(results, Array(5).fill({ ok: true }));
   assert.equal(jwksFetches, before + 1);
+});
 
-  // 存在しない kid を連打しても、再取得は一定間隔に 1 回まで
+test("存在しない kid を連打しても、JWKS の再取得は一定間隔に 1 回まで", async () => {
+  const before = jwksFetches;
   const key3 = await makeKey("unknown");
   for (let i = 0; i < 5; i++) assert.equal((await verify(await sign(key3))).status, 401);
-  assert.ok(jwksFetches <= before + 2);
+  assert.ok(jwksFetches <= before + 1);
 });
 
 test("環境変数が両方未設定なら素通し、片方だけなら設定ミスとして拒否する", async () => {

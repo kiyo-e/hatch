@@ -86,6 +86,19 @@ test("destroy: クリーンアップが不完全なら 502 を返す（CI で失
   assert.equal((await res.json()).ok, false);
 });
 
+test("register: 待機中に同じイメージが削除された場合は 409", async () => {
+  const { env } = createEnv({
+    async registerImage() {
+      throw new Error("Image img-1 was deleted by a pending cleanup while registering; rebuild the image and register again.");
+    },
+  });
+  const res = await worker.fetch(
+    api("/api/envs/pr-1/register", { method: "POST", body: JSON.stringify({ imageIdentifier: "img-1" }) }),
+    env
+  );
+  assert.equal(res.status, 409);
+});
+
 test("シークレットがない・誤っている場合は 401", async () => {
   const { env } = createEnv();
   const noSecret = new Request("https://api.preview.example.com/api/envs/pr-1/status");

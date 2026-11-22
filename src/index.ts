@@ -61,7 +61,15 @@ export default {
           );
         }
 
-        await stub.registerImage(imageIdentifier, payload.imageVersion);
+        try {
+          await stub.registerImage(imageIdentifier, payload.imageVersion);
+        } catch (err) {
+          // 実行中だった削除待ちの再試行で同じイメージが削除された場合は 409（CI で再ビルドして登録し直す）
+          if ((err as Error).message?.includes("deleted by a pending cleanup")) {
+            return Response.json({ ok: false, envId, error: (err as Error).message }, { status: 409 });
+          }
+          throw err;
+        }
         return Response.json({ ok: true, envId, imageIdentifier });
       }
 

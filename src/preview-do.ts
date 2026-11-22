@@ -83,6 +83,18 @@ export class CleanupIncompleteError extends Error {
   }
 }
 
+/**
+ * 登録しようとしたイメージが、実行中だった削除待ちの再試行で削除されたことを示す（再ビルドして登録し直す必要がある）。
+ */
+export class ImageDeletedDuringCleanupError extends Error {
+  constructor(imageIdentifier: string) {
+    super(
+      `Image ${imageIdentifier} was deleted by a pending cleanup while registering; rebuild the image and register again.`
+    );
+    this.name = "ImageDeletedDuringCleanupError";
+  }
+}
+
 export class PreviewEnvironmentDO extends DurableObject<Env> {
   private readonly aws: MicroVmClient;
   private bootPromise: Promise<ActiveVmState> | null = null;
@@ -90,6 +102,9 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   private cachedToken: CachedJweToken | null = null;
   private tokenPromise: { microvmId: string; promise: Promise<string> } | null = null;
   private lastForcedTokenRefresh: { microvmId: string; at: number } | null = null;
+  private cleanupInFlight: Promise<void> | null = null;
+  /** AWS に送信済みで完了待ちのイメージ削除 */
+  private imageDeletionInFlight: { imageIdentifier: string; promise: Promise<void> } | null = null;
   private vmStateCheck: {
     microvmId: string;
     at: number;
@@ -106,6 +121,19 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
    * 同時にゾンビイメージ掃除用の DO Alarm を設定する。
    */
   async registerImage(imageIdentifier: string, imageVersion?: string): Promise<void> {
+    // 同じイメージの削除が AWS に送信済みなら結果を待つ。削除が成功していたら、存在しないイメージを
+    // 登録しないよう拒否する（まだ送信していない削除は、クリーンアップ側が登録済みを確認してスキップする）
+    const deletion = this.imageDeletionInFlight;
+    if (deletion?.imageIdentifier === imageIdentifier) {
+      const deleted = await deletion.promise.then(
+        () => true,
+        () => false
+      );
+      if (deleted) {
+        throw new ImageDeletedDuringCleanupError(imageIdentifier);
+      }
+    }
+
     const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
     if (current?.microvmId) {
       await this.aws.terminateMicroVm(current.microvmId).catch(() => {});
@@ -176,8 +204,13 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
         await this.scheduleNextAlarm();
       }
     } catch (err) {
-      // 失敗分は runCleanup が削除待ちとして記録し、次の Alarm を設定済み
-      console.error("[preview-do] alarm cleanup incomplete:", err);
+      // CleanupIncompleteError は失敗分を削除待ちとして記録し、次の Alarm を設定済み。
+      // それ以外（ストレージ障害等）は再設定できていないため、再送出してプラットフォームの自動リトライに任せる
+      if (err instanceof CleanupIncompleteError) {
+        console.error("[preview-do] alarm cleanup incomplete:", err);
+        return;
+      }
+      throw err;
     }
   }
 
@@ -269,15 +302,13 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
 
     // トークンが想定外に失効していた場合（403）はトークンを再発行して 1 回リトライ。
     // アプリ自身の 403 で毎回発行しないよう、強制再発行は VM ごとに一定間隔に 1 回まで
-    if (
-      response.status === 403 &&
-      this.canRetryRequest(request) &&
-      this.claimForcedTokenRefresh(vm.microvmId)
-    ) {
-      await response.body?.cancel();
-      this.cachedToken = null;
-      token = await this.getValidJweToken(vm.microvmId);
-      response = await this.proxyToMicroVm(request, vm.endpointUrl, token);
+    if (response.status === 403 && this.canRetryRequest(request)) {
+      const refreshed = await this.refreshTokenAfter403(vm.microvmId, token);
+      if (refreshed) {
+        await response.body?.cancel();
+        token = refreshed;
+        response = await this.proxyToMicroVm(request, vm.endpointUrl, token);
+      }
     }
 
     // 寿命内でも AWS 側で TERMINATED / NOT_FOUND になっていた場合の自己修復リトライ（1 回だけ）
@@ -470,6 +501,26 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     return promise;
   }
 
+  /**
+   * 403 を受けたリクエスト用の新しいトークンを返す（再試行しない場合は null）。
+   * 同じ失効トークンで同時に 403 を受けたリクエストは、発行中・発行済みの新トークンに相乗りする。
+   */
+  private async refreshTokenAfter403(microvmId: string, staleToken: string): Promise<string | null> {
+    const cached = this.cachedToken;
+    if (cached && cached.microvmId === microvmId && cached.token !== staleToken) {
+      return cached.token;
+    }
+    if (this.tokenPromise?.microvmId === microvmId) {
+      const joined = await this.tokenPromise.promise;
+      return joined !== staleToken ? joined : null;
+    }
+    if (!this.claimForcedTokenRefresh(microvmId)) {
+      return null;
+    }
+    this.cachedToken = null;
+    return this.getValidJweToken(microvmId);
+  }
+
   private claimForcedTokenRefresh(microvmId: string): boolean {
     const last = this.lastForcedTokenRefresh;
     const now = Date.now();
@@ -540,7 +591,20 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   /**
    * MicroVM の終了とイメージの削除を行い、失敗分は削除待ちとして記録して Alarm で再試行する。
    */
-  private async runCleanup(targets: Omit<PendingCleanup, "retryAt">): Promise<void> {
+  private runCleanup(targets: Omit<PendingCleanup, "retryAt">): Promise<void> {
+    // 実行中のクリーンアップの後ろに直列につなぐ（自分自身を待たないよう、直前の Promise だけを待つ）
+    const previous = this.cleanupInFlight ?? Promise.resolve();
+    const run: Promise<void> = previous
+      .catch(() => {})
+      .then(() => this.doCleanup(targets))
+      .finally(() => {
+        if (this.cleanupInFlight === run) this.cleanupInFlight = null;
+      });
+    this.cleanupInFlight = run;
+    return run;
+  }
+
+  private async doCleanup(targets: Omit<PendingCleanup, "retryAt">): Promise<void> {
     const failed: Omit<PendingCleanup, "retryAt"> = { microvmIds: [], imageIdentifiers: [] };
 
     for (const id of targets.microvmIds) {
@@ -552,11 +616,18 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       }
     }
     for (const id of targets.imageIdentifiers) {
+      // 削除待ちに入った後で同じイメージが再登録されていたら消さない
+      const registered = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+      if (registered?.imageIdentifier === id) continue;
+      const promise = this.aws.deleteMicroVmImage(id);
+      this.imageDeletionInFlight = { imageIdentifier: id, promise };
       try {
-        await this.aws.deleteMicroVmImage(id);
+        await promise;
       } catch (err) {
         console.error(`[preview-do] DeleteMicrovmImage(${id}) failed:`, err);
         failed.imageIdentifiers.push(id);
+      } finally {
+        if (this.imageDeletionInFlight?.promise === promise) this.imageDeletionInFlight = null;
       }
     }
 

@@ -72,6 +72,7 @@ function createFakeAws() {
     runError: null,
     tokenError: null,
     deleteImageError: null,
+    deleteImageGate: null,
     stateGate: null,
     vmState: "RUNNING",
     endpointFor: (id) => `https://${id}.microvm.example`,
@@ -102,6 +103,7 @@ function createFakeAws() {
     },
     async deleteMicroVmImage(id) {
       aws.calls.push(["deleteImage", id]);
+      if (aws.deleteImageGate) await aws.deleteImageGate;
       if (aws.deleteImageError) throw aws.deleteImageError;
     },
   };
@@ -354,6 +356,18 @@ test("トークン失効の 403 は再発行して 1 回リトライする", asy
   assert.deepEqual(upstream.map((u) => u.auth), ["jwe-mvm-1-1", "jwe-mvm-1-2"]);
 });
 
+test("同じ失効トークンで同時に 403 を受けたリクエストは、全員が新トークンで再試行する", async () => {
+  const { aws, dObj } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/warm")); // jwe-mvm-1-1 をキャッシュ
+  upstreamHandler = (req) =>
+    new Response("", { status: req.headers.get("X-aws-proxy-auth") === "jwe-mvm-1-1" ? 403 : 200 });
+
+  const results = await Promise.all(Array.from({ length: 5 }, (_, i) => dObj.fetch(apiRequest(`/p${i}`))));
+  assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200, 200]);
+  assert.equal(aws.count("token"), 2, "再発行は 1 回だけ");
+});
+
 // --- 破棄と Alarm ---
 
 test("destroy でイメージ削除に失敗したら例外を投げ、削除待ちとして Alarm で再試行する", async () => {
@@ -386,6 +400,53 @@ test("削除待ちのイメージが再登録されたら削除対象から外�
   await dObj.registerImage("img-v1");
   assert.equal(ctx.data.get("pendingCleanup"), undefined);
   assert.equal((await dObj.getStatus()).registered, true);
+});
+
+test("削除待ちの再試行より前に再登録されたイメージは、再試行で削除しない", async () => {
+  const { aws, dObj, ctx } = setup();
+  ctx.data.set("pendingCleanup", {
+    microvmIds: [],
+    imageIdentifiers: ["img-a", "img-b"],
+    retryAt: Date.now(),
+  });
+  const gate = deferred();
+  aws.deleteImageGate = gate.promise;
+
+  const alarm = dObj.alarm();
+  await tick(); // img-a の削除が進行中（img-b はまだ送信していない）
+  await dObj.registerImage("img-b"); // 送信前のイメージなので待たずに登録される
+  aws.deleteImageGate = null;
+  gate.resolve();
+  await alarm;
+
+  assert.deepEqual(aws.calls.filter(([k]) => k === "deleteImage").map(([, id]) => id), ["img-a"]);
+  assert.equal((await dObj.getStatus()).imageIdentifier, "img-b");
+  assert.equal(ctx.data.get("pendingCleanup"), undefined);
+});
+
+test("登録の待機中に同じイメージの削除が完了していたら、登録を拒否する", async () => {
+  const { aws, dObj, ctx } = setup();
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
+  const gate = deferred();
+  aws.deleteImageGate = gate.promise;
+
+  const alarm = dObj.alarm();
+  await tick(); // img-a の削除リクエストが AWS に送信済み
+  const register = dObj.registerImage("img-a");
+  gate.resolve();
+  await alarm;
+
+  await assert.rejects(register, { name: "ImageDeletedDuringCleanupError" });
+  assert.equal((await dObj.getStatus()).registered, false);
+});
+
+test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
+  const { dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  ctx.storage.get = async () => {
+    throw new Error("storage unavailable");
+  };
+  await assert.rejects(dObj.alarm(), /storage unavailable/);
 });
 
 test("Alarm: 掃除期限を過ぎた環境は破棄し、期限前なら削除待ちの再試行だけ行う", async () => {

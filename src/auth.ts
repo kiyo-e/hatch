@@ -51,6 +51,7 @@ function base64UrlDecode(input: string): Uint8Array {
 // 未知の kid による JWKS 強制再取得の最短間隔（ランダムな kid で JWKS 取得を連打させないため）
 const JWKS_FORCE_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
 let lastForcedJwksRefreshAt = 0;
+let forcedJwksRefresh: Promise<JwkKey[]> | null = null;
 
 async function fetchAccessJwks(teamDomain: string, forceRefresh = false): Promise<JwkKey[]> {
   const now = Date.now();
@@ -82,12 +83,19 @@ async function findAccessJwk(teamDomain: string, kid: string | undefined): Promi
   const hit = cached.find((k) => k.kid === kid);
   if (hit) return hit;
 
-  const now = Date.now();
-  if (now - lastForcedJwksRefreshAt < JWKS_FORCE_REFRESH_MIN_INTERVAL_MS) {
-    return undefined;
+  // 同時に届いたリクエストは実行中の再取得に相乗りする（間隔制限は新たな再取得にのみ適用）
+  if (!forcedJwksRefresh) {
+    const now = Date.now();
+    if (now - lastForcedJwksRefreshAt < JWKS_FORCE_REFRESH_MIN_INTERVAL_MS) {
+      return undefined;
+    }
+    lastForcedJwksRefreshAt = now;
+    const refresh: Promise<JwkKey[]> = fetchAccessJwks(teamDomain, true).finally(() => {
+      if (forcedJwksRefresh === refresh) forcedJwksRefresh = null;
+    });
+    forcedJwksRefresh = refresh;
   }
-  lastForcedJwksRefreshAt = now;
-  const refreshed = await fetchAccessJwks(teamDomain, true);
+  const refreshed = await forcedJwksRefresh;
   return refreshed.find((k) => k.kid === kid);
 }
 
