@@ -1,0 +1,9 @@
+# ローカル開発用シークレット (`wrangler dev` が自動読み込み)
+# 本番環境では `wrangler secret put <NAME>` を使用してください
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+CI_WEBHOOK_SECRET=replace-with-random-secret
+
+# 任意: Cloudflare Access JWT 検証を有効にする場合
+# CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
+# CF_ACCESS_AUD=your-application-audience-tag

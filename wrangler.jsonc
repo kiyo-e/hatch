@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "preview-orchestrator",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PREVIEW_DO",
+        "class_name": "PreviewEnvironmentDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PreviewEnvironmentDO"]
+    }
+  ],
+  "vars": {
+    "AWS_REGION": "ap-northeast-1",
+    "APP_TARGET_PORT": "8080",
+    "PREVIEW_BASE_DOMAIN": "preview.example.com",
+    "API_HOSTNAME": "api.preview.example.com",
+    "COLD_START_LOADING_PAGE": "true",
+    "ZOMBIE_TTL_DAYS": "14"
+  }
+  // 以下のシークレットは `wrangler secret put` で登録してください:
+  // - AWS_ACCESS_KEY_ID
+  // - AWS_SECRET_ACCESS_KEY
+  // - CI_WEBHOOK_SECRET
+  // - CF_ACCESS_TEAM_DOMAIN (任意: Cloudflare Access 検証を有効化する場合)
+  // - CF_ACCESS_AUD         (任意: Cloudflare Access 検証を有効化する場合)
+}

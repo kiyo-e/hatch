@@ -1,0 +1,31 @@
+name: Register PR Preview Environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  register-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # TODO: ここで Dockerfile + S3 zip から `aws lambda-microvms create-microvm-image` を実行し、
+      # ビルド完了したイメージ ARN を IMAGE_ARN に出力してください。
+      - name: Build MicroVM Image (placeholder)
+        id: build
+        run: |
+          echo "image_arn=arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Register image to Cloudflare Workers Orchestrator
+        env:
+          CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
+          API_BASE_URL: https://api.preview.example.com
+          ENV_ID: pr-${{ github.event.pull_request.number }}
+          IMAGE_ARN: ${{ steps.build.outputs.image_arn }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            "${API_BASE_URL}/api/envs/${ENV_ID}/register" \
+            -H "Content-Type: application/json" \
+            -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}" \
+            -d "{\"imageIdentifier\":\"${IMAGE_ARN}\"}"

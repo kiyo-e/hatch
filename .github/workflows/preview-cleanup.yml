@@ -1,0 +1,19 @@
+name: Cleanup PR Preview Environment
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  destroy-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Destroy preview MicroVM and image
+        env:
+          CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
+          API_BASE_URL: https://api.preview.example.com
+          ENV_ID: pr-${{ github.event.pull_request.number }}
+        run: |
+          curl --fail-with-body -sS -X DELETE \
+            "${API_BASE_URL}/api/envs/${ENV_ID}/destroy" \
+            -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}"
