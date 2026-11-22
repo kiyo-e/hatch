@@ -34,7 +34,7 @@ function previewStub(env: Env, envId: string) {
 }
 
 /** 台帳の更新は一覧表示のためのもの。失敗しても CI の登録・破棄は失敗にしない */
-async function updateRegistry(action: () => Promise<void>, label: string): Promise<void> {
+async function updateRegistry(action: () => Promise<unknown>, label: string): Promise<void> {
   try {
     await action();
   } catch (err) {

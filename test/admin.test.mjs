@@ -240,7 +240,7 @@ test("管理画面: 破棄は同じオリジンからの POST だけ受け付け
 
 test("管理画面: 破棄が不完全でも 500 にせず、自動で再試行されることを表示する", async (t) => {
   t.mock.method(console, "error", () => {});
-  const { env, registry } = createEnv({ destroyError: new Error("Cleanup incomplete") });
+  const { env, registry } = createEnv({ destroyError: new Error("Cleanup incomplete (microvms: -, images: img-1); it will be retried automatically.") });
   await register(env, "pr-1");
   const res = await worker.fetch(
     page("api.localhost", "/admin/envs/pr-1/destroy", {
@@ -258,4 +258,92 @@ test("プレビューのホストでは /admin もアプリへ転送する（管
   const { env } = createEnv();
   const res = await worker.fetch(page("pr-1.localhost", "/admin"), env);
   assert.equal(await res.text(), "proxied");
+});
+
+// --- レビュー指摘への対応 ---
+
+test("台帳: 読んだあとに登録し直された環境は、古い revision での削除では消えない", async () => {
+  const registry = new EnvRegistryDO({ storage: createStorage() }, {});
+  await registry.upsert("pr-1", "img-a");
+  const [read] = await registry.list();
+  await registry.upsert("pr-1", "img-b"); // 読んだあとに登録し直される
+  assert.equal(await registry.remove("pr-1", read.revision), false);
+  assert.deepEqual((await registry.list()).map((e) => e.imageIdentifier), ["img-b"]);
+  assert.equal(await registry.remove("pr-1", read.revision + 1), true);
+  assert.deepEqual(await registry.list(), []);
+});
+
+test("管理画面: 状態を読んだあとに登録し直された環境は、一覧の整理で台帳から消さない", async () => {
+  const { env, registry } = createEnv();
+  await register(env, "pr-1");
+  // getStatus が「登録なし」を返したあと、台帳の整理より先に CI が登録し直した状況を作る
+  const original = env.PREVIEW_DO.get;
+  env.PREVIEW_DO = {
+    idFromName: (n) => n,
+    get: (n) => ({
+      ...original(n),
+      async getStatus() {
+        await registry.upsert(n, "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-1-v2");
+        return { registered: false, booting: false };
+      },
+    }),
+  };
+  const res = await worker.fetch(page("api.localhost", "/admin"), env);
+  assert.equal(res.status, 200);
+  assert.deepEqual((await registry.list()).map((e) => e.envId), ["pr-1"]);
+});
+
+test("管理画面: 1 つの環境の状態が取れなくても、一覧はほかの環境ごと表示する", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const { env, registry } = createEnv();
+  await register(env, "pr-1");
+  await register(env, "pr-2");
+  const original = env.PREVIEW_DO.get;
+  env.PREVIEW_DO = {
+    idFromName: (n) => n,
+    get: (n) =>
+      n === "pr-2"
+        ? { ...original(n), async getStatus() { throw new Error("Durable Object is overloaded"); } }
+        : original(n),
+  };
+  const res = await worker.fetch(page("api.localhost", "/admin"), env);
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.match(body, /環境の一覧（2）/);
+  assert.match(body, /href="\/admin\/envs\/pr-1"/);
+  assert.match(body, /href="\/admin\/envs\/pr-2"[\s\S]*状態を取得できません/);
+  assert.deepEqual((await registry.list()).map((e) => e.envId).sort(), ["pr-1", "pr-2"], "取れなかった環境は台帳から外さない");
+});
+
+test("管理画面: 削除待ちが記録されない破棄の失敗では、自動で再試行されるとは表示しない", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const { env, registry } = createEnv({ destroyError: new Error("Network connection lost.") });
+  await register(env, "pr-1");
+  const res = await worker.fetch(
+    page("api.localhost", "/admin/envs/pr-1/destroy", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: "http://api.localhost" },
+    }),
+    env
+  );
+  const notice = new URL(res.headers.get("Location"), "http://x").searchParams.get("notice");
+  assert.match(notice, /自動では再試行されない/);
+  assert.doesNotMatch(notice, /自動で再試行されます/);
+  assert.deepEqual((await registry.list()).map((e) => e.envId), ["pr-1"]);
+});
+
+test("管理画面: 破棄が済んだあとの台帳の更新に失敗しても、破棄は成功として表示する", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const { env, statuses } = createEnv();
+  await register(env, "pr-1");
+  env.ENV_REGISTRY = { idFromName: (n) => n, get: () => ({ remove: async () => { throw new Error("registry down"); } }) };
+  const res = await worker.fetch(
+    page("api.localhost", "/admin/envs/pr-1/destroy", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: "http://api.localhost" },
+    }),
+    env
+  );
+  assert.equal(new URL(res.headers.get("Location"), "http://x").searchParams.get("notice"), "pr-1 を破棄しました");
+  assert.equal(statuses["pr-1"].registered, false);
 });

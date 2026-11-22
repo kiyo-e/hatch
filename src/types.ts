@@ -36,6 +36,8 @@ export interface RegistryEntry {
   imageIdentifier: string;
   registeredAt: number; // epoch ms
   updatedAt: number; // epoch ms
+  /** 登録のたびに増える番号（一覧の整理で、読んだあとに登録し直された環境を消さないために使う） */
+  revision?: number;
 }
 
 export type MicroVmLifecycleState =

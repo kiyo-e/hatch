@@ -16,26 +16,35 @@ export function registryStub(env: Env) {
 
 interface EnvRow {
   entry: RegistryEntry;
-  status: PreviewStatusResponse;
+  /** 状態を取得できなかった環境は undefined（一覧からは外さず、取得できないことを表示する） */
+  status?: PreviewStatusResponse;
 }
 
 /**
- * 台帳の環境ごとに実際の状態を取得する。登録も削除待ちも無い環境（Alarm で自動破棄された等）は台帳から外す。
+ * 台帳の環境ごとに実際の状態を取得する。
+ * - 1 つの環境で状態の取得に失敗しても、一覧全体は表示する
+ * - 登録も削除待ちも無い環境（Alarm で自動破棄された等）は台帳から外す。ただし状態を読んだあとに
+ *   登録し直された環境は消さない（台帳の revision が読んだときのままの場合だけ外す）
  */
 async function loadEnvs(env: Env): Promise<EnvRow[]> {
   const registry = registryStub(env);
   const entries = await registry.list();
-  const rows = await Promise.all(
+  const results = await Promise.allSettled(
     entries.map(async (entry): Promise<EnvRow | null> => {
       const status = await env.PREVIEW_DO.get(env.PREVIEW_DO.idFromName(entry.envId)).getStatus();
       if (!status.registered && !status.cleanupPending) {
-        await registry.remove(entry.envId);
-        return null;
+        const removed = await registry.remove(entry.envId, entry.revision ?? 0);
+        // 読んだあとに登録し直されていれば残す（状態は次に一覧を開いたときに表示する）
+        return removed ? null : { entry };
       }
       return { entry, status };
     })
   );
-  return rows.filter((row): row is EnvRow => row !== null);
+  return results.flatMap((result, i): EnvRow[] => {
+    if (result.status === "fulfilled") return result.value ? [result.value] : [];
+    console.error(`[admin] getStatus ${entries[i].envId} failed:`, result.reason);
+    return [{ entry: entries[i] }];
+  });
 }
 
 function previewUrl(requestUrl: string, envId: string, env: Env): string {
@@ -65,7 +74,8 @@ function shortImage(identifier?: string): Markup {
   return html`<code title="${identifier}">${identifier.split(":").pop() ?? identifier}</code>`;
 }
 
-function stateBadge(status: PreviewStatusResponse): Markup {
+function stateBadge(status: PreviewStatusResponse | undefined): Markup {
+  if (!status) return html`<span class="badge">状態を取得できません</span>`;
   if (!status.registered) return html`<span class="badge warn">破棄中</span>`;
   if (status.booting) return html`<span class="badge info">起動中</span>`;
   if (status.microvmId) return html`<span class="badge ok">稼働中</span>`;
@@ -149,16 +159,16 @@ function listPage(rows: EnvRow[], requestUrl: string, env: Env, notice?: string)
             </thead>
             <tbody>
               ${rows.map(({ entry, status }) => {
-                const pending = status.cleanupPending;
+                const pending = status?.cleanupPending;
                 const pendingCount = pending ? pending.microvmIds.length + pending.imageIdentifiers.length : 0;
                 return html`<tr>
                   <td><a href="/admin/envs/${entry.envId}">${entry.envId}</a></td>
                   <td>${stateBadge(status)}</td>
-                  <td class="wide-only">${shortImage(status.imageIdentifier ?? entry.imageIdentifier)}</td>
-                  <td>${formatTime(status.expiresAt)}</td>
+                  <td class="wide-only">${shortImage(status?.imageIdentifier ?? entry.imageIdentifier)}</td>
+                  <td>${formatTime(status?.expiresAt)}</td>
                   <td class="wide-only">${formatTime(entry.updatedAt)}</td>
                   <td>${pendingCount > 0 ? html`<span class="badge warn">${pendingCount} 件</span>` : EMPTY}</td>
-                  <td>${status.registered ? html`<a href="${previewUrl(requestUrl, entry.envId, env)}" target="_blank" rel="noopener">開く</a>` : ""}</td>
+                  <td>${status?.registered ? html`<a href="${previewUrl(requestUrl, entry.envId, env)}" target="_blank" rel="noopener">開く</a>` : ""}</td>
                 </tr>`;
               })}
             </tbody>
@@ -236,14 +246,27 @@ adminApp.get("/envs/:envId", async (c) => {
 adminApp.post("/envs/:envId/destroy", async (c) => {
   const envId = c.req.param("envId");
   if (!ENV_ID_REGEX.test(envId)) return c.notFound();
-  let notice: string;
+  const back = (notice: string) => c.redirect(`/admin?notice=${encodeURIComponent(notice)}`, 303);
+
   try {
     await c.env.PREVIEW_DO.get(c.env.PREVIEW_DO.idFromName(envId)).destroy();
-    await registryStub(c.env).remove(envId);
-    notice = `${envId} を破棄しました`;
   } catch (err) {
-    console.error(`[admin] destroy ${envId} incomplete:`, err);
-    notice = `${envId} の破棄は一部が未完了です。残りは自動で再試行されます`;
+    // 「自動で再試行される」と言えるのは、削除しきれなかった分が削除待ちとして記録された場合
+    // （CleanupIncompleteError）だけ。RPC やストレージの失敗では何も記録されていないことがある
+    const message = (err as Error)?.message ?? "";
+    console.error(`[admin] destroy ${envId} failed:`, err);
+    return back(
+      message.startsWith("Cleanup incomplete")
+        ? `${envId} の破棄は一部が未完了です。残りは自動で再試行されます`
+        : `${envId} の破棄に失敗しました。自動では再試行されないため、もう一度破棄してください`
+    );
   }
-  return c.redirect(`/admin?notice=${encodeURIComponent(notice)}`, 303);
+
+  try {
+    await registryStub(c.env).remove(envId);
+  } catch (err) {
+    // 環境は破棄済み。台帳に残っていても、次に一覧を開いたときに外れる
+    console.error(`[admin] registry remove ${envId} failed:`, err);
+  }
+  return back(`${envId} を破棄しました`);
 });
