@@ -29,6 +29,7 @@
   // 以下のシークレットは `wrangler secret put` で登録してください:
   // - AWS_ACCESS_KEY_ID
   // - AWS_SECRET_ACCESS_KEY
+  // - AWS_SESSION_TOKEN     (任意: 一時的な認証情報を使う場合)
   // - CI_WEBHOOK_SECRET
   // - CF_ACCESS_TEAM_DOMAIN (任意: Cloudflare Access 検証を有効化する場合)
   // - CF_ACCESS_AUD         (任意: Cloudflare Access 検証を有効化する場合)

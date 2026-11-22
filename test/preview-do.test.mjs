@@ -94,9 +94,12 @@ function createFakeAws() {
       if (aws.tokenError) throw aws.tokenError;
       return { token: `jwe-${microvmId}-${aws.count("token")}`, expirationInMinutes: 15 };
     },
+    /** 設定すると、終了済みの VM の状態をこの関数で返す（既定は即座に TERMINATED） */
+    terminatedStateFor: null,
     async getMicroVmState(id) {
       aws.calls.push(["getState", id]);
       if (aws.stateGate) await aws.stateGate;
+      if (aws.terminated.includes(id)) return aws.terminatedStateFor?.(id) ?? "TERMINATED";
       return aws.vmState;
     },
     async terminateMicroVm(id) {
@@ -116,10 +119,10 @@ function createFakeAws() {
 
 const ENV = { APP_TARGET_PORT: "8080", COLD_START_LOADING_PAGE: "true", ZOMBIE_TTL_DAYS: "14" };
 
-function setup() {
+function setup(options) {
   const ctx = createCtx();
   const aws = createFakeAws();
-  const dObj = new PreviewEnvironmentDO(ctx, ENV, aws);
+  const dObj = new PreviewEnvironmentDO(ctx, ENV, aws, options);
   return { ctx, aws, dObj };
 }
 
@@ -318,6 +321,42 @@ test("RunMicrovm 失敗時は AWS のエラー内容を返さず 502、待機時
   assert.ok(BOOT_FAILURE_BACKOFF_MS >= 10_000);
 });
 
+test("コールドスタートの裏で起動に失敗したら、原因をログに残す", async (t) => {
+  const { aws, dObj, ctx } = setup();
+  const logged = t.mock.method(console, "error", () => {});
+  await dObj.registerImage("img-v1");
+  aws.runError = new Error("RunMicrovm failed (403): The security token included in the request is expired");
+
+  const res = await dObj.fetch(htmlRequest("/"));
+  assert.equal(res.status, 503);
+  await ctx.settle();
+
+  const messages = logged.mock.calls.map((c) => c.arguments.map(String).join(" "));
+  assert.ok(
+    messages.some((m) => m.includes("background boot failed") && m.includes("security token")),
+    `ログに起動失敗の原因が出ていない: ${messages.join(" | ")}`
+  );
+});
+
+test("コールドスタート中に破棄されても、起動の取りやめはエラーとしてログに残さない", async (t) => {
+  const { aws, dObj, ctx } = setup();
+  const logged = t.mock.method(console, "error", () => {});
+  await dObj.registerImage("img-v1");
+  const gate = deferred();
+  aws.runGate = gate.promise;
+
+  assert.equal((await dObj.fetch(htmlRequest("/"))).status, 503);
+  await tick();
+  await dObj.destroy();
+  gate.resolve();
+  await ctx.settle();
+
+  assert.ok(
+    !logged.mock.calls.some((c) => String(c.arguments[0]).includes("background boot failed")),
+    "再登録・破棄による起動の取りやめは失敗ではない"
+  );
+});
+
 test("JWE 発行が失敗したら例外を投げずに 502 を返す", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
@@ -393,6 +432,61 @@ test("destroy でイメージ削除に失敗したら例外を投げ、削除待
   assert.equal(aws.count("deleteImage"), 2);
   assert.equal(ctx.data.size, 0);
   assert.equal(ctx.alarm, null);
+});
+
+test("destroy: MicroVM が終了しきるのを待ってからイメージを削除する", async () => {
+  const { aws, dObj, ctx } = setup({ terminationPollIntervalMs: 1, terminationWaitTimeoutMs: 1000 });
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+
+  // 実際の AWS と同じく、終了は非同期に進み、終了しきるまでイメージを削除できない
+  let checks = 0;
+  aws.terminatedStateFor = () => (++checks < 3 ? "TERMINATING" : "TERMINATED");
+  const realDelete = aws.deleteMicroVmImage;
+  aws.deleteMicroVmImage = async (id) => {
+    if (checks < 3) throw new Error("DeleteMicrovmImage failed (400): Cannot delete microvm image with running microvms.");
+    return realDelete(id);
+  };
+
+  await dObj.destroy();
+  assert.deepEqual(
+    aws.calls.filter(([k]) => k !== "token" && k !== "run").map(([k]) => k),
+    ["terminate", "getState", "getState", "getState", "deleteImage"]
+  );
+  assert.equal(ctx.data.size, 0);
+  assert.equal(ctx.alarm, null);
+});
+
+test("destroy: 終了の待機が上限を過ぎたら削除を試み、失敗分は削除待ちとして Alarm で再試行する", async (t) => {
+  const { aws, dObj } = setup({ terminationPollIntervalMs: 1, terminationWaitTimeoutMs: 5 });
+  t.mock.method(console, "error", () => {});
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+  aws.terminatedStateFor = () => "TERMINATING";
+  aws.deleteImageError = new Error("DeleteMicrovmImage failed (400): Cannot delete microvm image with running microvms.");
+
+  await assert.rejects(dObj.destroy(), { name: "CleanupIncompleteError" });
+  assert.equal(aws.count("deleteImage"), 1);
+  const status = await dObj.getStatus();
+  assert.deepEqual(status.cleanupPending, { microvmIds: [], imageIdentifiers: ["img-v1"] });
+
+  // 次の Alarm では終了済みなので、待たずに削除できる
+  aws.terminatedStateFor = null;
+  aws.deleteImageError = null;
+  await dObj.alarm();
+  assert.equal(aws.count("deleteImage"), 2);
+  assert.equal((await dObj.getStatus()).cleanupPending, undefined);
+});
+
+test("イメージを削除しない処理（登録時の旧 VM 終了）では、終了を待たない", async () => {
+  const { aws, dObj } = setup({ terminationPollIntervalMs: 1, terminationWaitTimeoutMs: 1000 });
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+  aws.terminatedStateFor = () => "TERMINATING";
+
+  await dObj.registerImage("img-v2");
+  assert.ok(aws.terminated.includes("mvm-1"));
+  assert.equal(aws.count("getState"), 0);
 });
 
 test("削除待ちのイメージが再登録されたら削除対象から外す", async () => {
