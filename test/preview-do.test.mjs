@@ -535,6 +535,96 @@ test("削除待ちのイメージの再登録が失敗したら、削除待ち�
   assert.ok(ctx.alarm, "再試行の Alarm が設定されている");
 });
 
+test("destroy で状態の削除に失敗しても、破棄済みとして扱い Alarm で削除を再試行する", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+  const del = ctx.storage.delete;
+  ctx.storage.delete = async (key) => {
+    if (key === "state") throw new Error("storage unavailable");
+    return del(key);
+  };
+
+  await assert.rejects(dObj.destroy(), /storage unavailable/);
+  assert.equal((await dObj.fetch(apiRequest("/"))).status, 404, "破棄途中の環境を再起動しない");
+  assert.equal((await dObj.getStatus()).registered, false);
+  assert.equal(aws.count("run"), 1);
+
+  ctx.storage.delete = del;
+  await dObj.alarm();
+  assert.equal(ctx.data.get("state"), undefined);
+  assert.ok(aws.calls.some(([k, id]) => k === "deleteImage" && id === "img-v1"));
+  assert.ok(aws.terminated.includes("mvm-1"));
+});
+
+test("古くなった起動結果の VM を永続化できなければ、直接終了する", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  const gate = deferred();
+  aws.runGate = gate.promise;
+
+  const pending = dObj.fetch(apiRequest("/"));
+  await tick();
+  await dObj.registerImage("img-v2");
+  const put = ctx.storage.put;
+  ctx.storage.put = async (key, value) => {
+    if (key === "pendingCleanup" && value.microvmIds.includes("mvm-1")) throw new Error("storage unavailable");
+    return put(key, value);
+  };
+  gate.resolve();
+  await pending;
+  await ctx.settle();
+
+  assert.ok(aws.terminated.includes("mvm-1"));
+});
+
+test("キューに先に並んだ destroy は、後ろに並んだ同じイメージの登録を消さない", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-a");
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-z"], retryAt: Date.now() });
+  const gate = deferred();
+  aws.deleteImageGate = gate.promise;
+
+  const alarm = dObj.alarm(); // img-z の削除中にキューを占有
+  await tick();
+  const destroy = dObj.destroy(); // 開始時に img-a を削除対象に入れる
+  const register = dObj.registerImage("img-a"); // destroy の後ろに並ぶ
+  await tick();
+  aws.deleteImageGate = null;
+  gate.resolve();
+  await alarm;
+  await destroy;
+  await register;
+
+  assert.deepEqual(aws.calls.filter(([k]) => k === "deleteImage").map(([, id]) => id), ["img-z"]);
+  assert.equal((await dObj.getStatus()).imageIdentifier, "img-a");
+});
+
+test("Alarm: 掃除期限はキューの中で判定し、先に並んだ登録で更新された環境を消さない", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-old");
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-z"], retryAt: Date.now() });
+  const gate = deferred();
+  aws.deleteImageGate = gate.promise;
+
+  const first = dObj.alarm(); // 期限前なので削除の再試行だけ（img-z の削除中にキューを占有）
+  await tick();
+  const state = ctx.data.get("state");
+  state.zombieAt = Date.now() - 1; // ここで掃除期限を過ぎる
+  ctx.data.set("state", state);
+  const register = dObj.registerImage("img-new");
+  await tick(); // 登録がキューに並ぶのを待つ
+  const second = dObj.alarm(); // 登録の後ろに並ぶ
+  await tick();
+  aws.deleteImageGate = null;
+  gate.resolve();
+  await first;
+  await register;
+  await second;
+
+  assert.equal((await dObj.getStatus()).imageIdentifier, "img-new");
+});
+
 test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");

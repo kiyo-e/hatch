@@ -68,6 +68,8 @@ export interface PendingCleanup {
   microvmIds: string[];
   imageIdentifiers: string[];
   retryAt: number; // epoch ms
+  /** 破棄の途中で状態の削除が終わっていない（有効な登録として扱わず、Alarm で状態の削除から再試行する） */
+  destroyState?: boolean;
 }
 
 export interface RegisterImagePayload {
