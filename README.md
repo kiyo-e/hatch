@@ -51,7 +51,9 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 ### 1. 依存関係のインストールと型チェック
 
 ```bash
-npm install
+nvm install && nvm use
+npm install -g "$(node -p 'require("./package.json").packageManager')"
+npm ci
 npm run typecheck
 npm test
 ```
