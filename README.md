@@ -39,6 +39,7 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 │   ├── helpers/register-ts-hooks.mjs  # src/*.ts を直接読み込むためのフック
 │   ├── preview-do.test.mjs            # Durable Object の振る舞い
 │   ├── auth.test.mjs                  # Cloudflare Access JWT 検証
+│   ├── aws-microvm.test.mjs           # AWS クライアントの認証情報
 │   ├── router.test.mjs                # 管理 API の入力検証
 │   └── preview-orchestrator.test.mjs  # 設定・ソースの契約
 ├── examples/github-actions/   # アプリ側リポジトリに置く CI の例（このリポジトリでは実行されない）
@@ -78,6 +79,8 @@ npm test
 ```bash
 npx wrangler secret put AWS_ACCESS_KEY_ID
 npx wrangler secret put AWS_SECRET_ACCESS_KEY
+# 任意: 一時的な認証情報（STS）を使う場合のみ。期限が切れると AWS API が失敗するため、本番では長期のアクセスキーを推奨します
+# npx wrangler secret put AWS_SESSION_TOKEN
 npx wrangler secret put CI_WEBHOOK_SECRET
 
 # 任意: Cloudflare Access JWT 検証を有効化する場合（2 つとも設定してください。片方だけの場合はプレビューへのアクセスを 500 で拒否します）
@@ -143,8 +146,24 @@ Worker に渡す IAM ユーザーには以下のアクションを許可して�
 
 ## Rails 側の注意点
 
-プロキシ時に `X-Forwarded-Host: pr-123.preview.example.com` および `X-Forwarded-Proto: https` を付与します。Rails で `Blocked host` エラーを防ぐため、`config/environments/production.rb`（または `staging.rb`）に以下を追加してください。
+プロキシ時に `X-Forwarded-Host: pr-123.preview.example.com` および `X-Forwarded-Proto: https` を付与します。一方、MicroVM のエンドポイントへ接続するため、アプリに届く `Host` ヘッダーは MicroVM のエンドポイント（例: `xxxx.lambda-microvm.ap-northeast-1.on.aws`）になります。Rails はこの 2 つを次のように使うため、`config/environments/production.rb`（または `staging.rb`）に以下を設定してください。
 
 ```ruby
-config.hosts << /\A[a-z0-9-]+\.preview\.example\.com\z/
+# Host authorization は Host と X-Forwarded-Host の両方を検査する。両方を許可しないと Blocked host (403) になる
+# Rails が \A...(:port)?\z で自動的に囲むので、正規表現に \A / \z は書かない
+config.hosts << /[a-z0-9-]+\.preview\.example\.com/
+config.hosts << /[a-z0-9-]+\.lambda-microvm\.[a-z0-9-]+\.on\.aws/
+
+# ActionCable の「同じホストからの接続」判定は Origin と Host ヘッダーを比べるため、プレビューの Origin を明示的に許可する
+config.action_cable.allowed_request_origins = [%r{\Ahttps://[a-z0-9-]+\.preview\.example\.com\z}]
+```
+
+フォームの CSRF 検証（Origin と `request.base_url` の比較）は、`X-Forwarded-Host` / `X-Forwarded-Proto` から組み立てた `https://pr-123.preview.example.com` と一致するため、追加の設定は不要です。最小構成の Rails 8.1 アプリで、POST（CSRF トークン・Origin 検証）、セッション Cookie、リダイレクト、ActionCable が実際の AWS Lambda MicroVMs 上で動くことを確認しています。
+
+### `wrangler dev` で試す場合
+
+`wrangler dev` はリクエストの `Origin` / `Referer` などのヘッダーに含まれる URL を、内部の URL（既定では `http://`）に書き換えます。そのままでは Rails に `Origin: http://...` が届き、`base_url`（`https://...`）と一致しないため、CSRF 検証と ActionCable が失敗します。ローカルで試すときは `--upstream-protocol https` を付けてください（レスポンスの `Location` は `http://` に書き換えられますが、本番では起きません）。
+
+```bash
+npx wrangler dev --upstream-protocol https
 ```
