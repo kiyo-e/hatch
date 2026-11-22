@@ -168,13 +168,15 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       zombieAt: now + this.getZombieTtlMs(),
       updatedAt: now,
     };
-    // 旧 MicroVM は先に削除待ちとして永続化してから終了する（終了に失敗しても Alarm で再試行される）。
-    // 未完了の破棄（状態の削除待ち）があれば、この登録が後勝ちするので取り消す
-    await this.enqueueCleanup(
-      { microvmIds: current?.microvmId ? [current.microvmId] : [], imageIdentifiers: [] },
-      { destroyState: false }
-    );
+    // 旧 MicroVM は先に削除待ちとして永続化してから終了する（終了に失敗しても Alarm で再試行される）
+    await this.enqueueCleanup({
+      microvmIds: current?.microvmId ? [current.microvmId] : [],
+      imageIdentifiers: [],
+    });
     await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
+    // 登録を確定してから、未完了の破棄（状態の削除待ち）を取り消す（この登録が後勝ちする）。
+    // 状態の書き込みに失敗した場合は破棄の意図が残り、古い環境は有効に戻らない
+    await this.enqueueCleanup({ microvmIds: [], imageIdentifiers: [] }, { destroyState: false });
     // 登録を確定したので削除待ちから外す（外し損ねても、登録済みのイメージはクリーンアップが削除しない）
     await this.removeFromPendingCleanup({ microvmIds: [], imageIdentifiers: [imageIdentifier] });
     await this.scheduleNextAlarm();

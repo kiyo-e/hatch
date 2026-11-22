@@ -652,6 +652,30 @@ test("再登録が失敗したとき、削除待ちを書き戻せない状況�
   assert.deepEqual(ctx.data.get("pendingCleanup").imageIdentifiers, ["img-a"]);
 });
 
+test("破棄途中の環境への再登録が失敗しても、破棄の意図は残り古い環境は有効に戻らない", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-old");
+  const del = ctx.storage.delete;
+  ctx.storage.delete = async (key) => {
+    if (key === "state") throw new Error("storage unavailable");
+    return del(key);
+  };
+  await assert.rejects(dObj.destroy()); // 状態の削除に失敗し、破棄の意図が残る
+  ctx.storage.delete = del;
+
+  const put = ctx.storage.put;
+  ctx.storage.put = async (key, value) => {
+    if (key === "state") throw new Error("storage unavailable");
+    return put(key, value);
+  };
+  await assert.rejects(dObj.registerImage("img-new"), /storage unavailable/);
+  ctx.storage.put = put;
+
+  assert.equal((await dObj.getStatus()).registered, false);
+  assert.equal((await dObj.fetch(apiRequest("/"))).status, 404);
+  assert.equal(aws.count("run"), 0);
+});
+
 test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
