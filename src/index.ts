@@ -12,8 +12,12 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// DNS ラベルとして有効な envId（管理 API とプレビューのサブドメインで同じ規則を使う）
+const ENV_ID_PATTERN = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+const API_PATH_PATTERN = new RegExp(`^/api/envs/(${ENV_ID_PATTERN})/(register|destroy|status)$`);
+
 export function extractPreviewEnvId(hostname: string, baseDomain: string): string | null {
-  const pattern = new RegExp(`^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\\.${escapeRegExp(baseDomain)}$`);
+  const pattern = new RegExp(`^(${ENV_ID_PATTERN})\\.${escapeRegExp(baseDomain)}$`);
   const match = hostname.toLowerCase().match(pattern);
   return match ? match[1] : null;
 }
@@ -30,7 +34,7 @@ export default {
         return Response.json({ error: "Unauthorized" }, { status: 401 });
       }
 
-      const match = url.pathname.match(/^\/api\/envs\/([a-z0-9-]+)\/(register|destroy|status)$/);
+      const match = url.pathname.match(API_PATH_PATTERN);
       if (!match) {
         return Response.json({ error: "Not Found" }, { status: 404 });
       }
@@ -45,21 +49,40 @@ export default {
         } catch {
           return Response.json({ error: "Invalid JSON body" }, { status: 400 });
         }
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+          return Response.json({ error: "JSON body must be an object" }, { status: 400 });
+        }
 
         const imageIdentifier = payload.imageIdentifier ?? payload.imageId;
-        if (!imageIdentifier || typeof imageIdentifier !== "string") {
+        if (!imageIdentifier || typeof imageIdentifier !== "string" || imageIdentifier.length > 256) {
           return Response.json(
             { error: "imageIdentifier (or imageId) is required" },
             { status: 400 }
           );
         }
 
-        await stub.registerImage(imageIdentifier, payload.imageVersion);
+        try {
+          await stub.registerImage(imageIdentifier, payload.imageVersion);
+        } catch (err) {
+          // 実行中だった削除待ちの再試行で同じイメージが削除された場合は 409（CI で再ビルドして登録し直す）
+          if ((err as Error).message?.includes("deleted by a pending cleanup")) {
+            return Response.json({ ok: false, envId, error: (err as Error).message }, { status: 409 });
+          }
+          throw err;
+        }
         return Response.json({ ok: true, envId, imageIdentifier });
       }
 
       if (action === "destroy" && request.method === "DELETE") {
-        await stub.destroy();
+        try {
+          await stub.destroy();
+        } catch (err) {
+          // 削除に失敗したリソースは DO が Alarm で再試行する。CI 側で失敗を検知できるよう 502 を返す
+          return Response.json(
+            { ok: false, envId, error: (err as Error).message },
+            { status: 502 }
+          );
+        }
         return Response.json({ ok: true, envId });
       }
 

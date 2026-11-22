@@ -9,7 +9,7 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 - **自己修復リトライ**: 寿命内でも AWS 側で `TERMINATED` / `NOT_FOUND` になっていた場合は `GetMicrovm` で状態確認のうえ 1 回だけ再起動リトライします。トークン失効（403）時は JWE トークンを再発行してリトライします。
 - **HTTP / WebSocket 透過プロキシ**: `X-aws-proxy-auth`（JWE）と `X-aws-proxy-port` を自動付与し、ActionCable 等の `Upgrade: websocket` リクエストも同じコードパスで転送します。
 - **コールドスタート UX 改善**: `COLD_START_LOADING_PAGE=true` の場合、起動中のブラウザリクエスト（`Accept: text/html`）には 3 秒自動リロードの軽量 HTML（HTTP 503 + `Retry-After: 3`）を即返し、バックグラウンドで起動を完了させます。
-- **DO Alarm によるゾンビイメージ掃除**: `registerImage` 時に `ZOMBIE_TTL_DAYS`（既定 14 日）後の Alarm を設定し、PR クローズ Webhook が取りこぼされても `destroy()` で自動削除します。
+- **DO Alarm によるゾンビイメージ掃除**: `registerImage` 時に `ZOMBIE_TTL_DAYS`（既定 14 日）後の Alarm を設定し、PR クローズ Webhook が取りこぼされても `destroy()` で自動削除します。`destroy` で MicroVM の終了やイメージの削除に失敗した分は削除待ちとして記録し、10 分後の Alarm で再試行します。
 
 ## 公式 API 仕様への準拠ポイント
 
@@ -35,9 +35,13 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 │   ├── auth.ts           # CI Webhook 定数時間シークレット検証 & Cloudflare Access JWT 検証
 │   ├── loading-page.ts   # コールドスタート用 3 秒自動リロード HTML
 │   └── types.ts          # 共通型定義
-├── test/
-│   └── preview-orchestrator.test.mjs  # Node.js 標準テストランナーによる単体テスト
-├── .github/workflows/
+├── test/                 # Node.js 標準テストランナーによるテスト
+│   ├── helpers/register-ts-hooks.mjs  # src/*.ts を直接読み込むためのフック
+│   ├── preview-do.test.mjs            # Durable Object の振る舞い
+│   ├── auth.test.mjs                  # Cloudflare Access JWT 検証
+│   ├── router.test.mjs                # 管理 API の入力検証
+│   └── preview-orchestrator.test.mjs  # 設定・ソースの契約
+├── examples/github-actions/   # アプリ側リポジトリに置く CI の例（このリポジトリでは実行されない）
 │   ├── preview-deploy.yml   # PR 更新時のイメージ登録例
 │   └── preview-cleanup.yml  # PR クローズ時の削除例
 ├── wrangler.jsonc
@@ -76,7 +80,7 @@ npx wrangler secret put AWS_ACCESS_KEY_ID
 npx wrangler secret put AWS_SECRET_ACCESS_KEY
 npx wrangler secret put CI_WEBHOOK_SECRET
 
-# 任意: Cloudflare Access JWT 検証を有効化する場合
+# 任意: Cloudflare Access JWT 検証を有効化する場合（2 つとも設定してください。片方だけの場合はプレビューへのアクセスを 500 で拒否します）
 npx wrangler secret put CF_ACCESS_TEAM_DOMAIN
 npx wrangler secret put CF_ACCESS_AUD
 ```
@@ -119,9 +123,23 @@ Worker に渡す IAM ユーザーには以下のアクションを許可して�
 - `POST /api/envs/:envId/register`
   - Body: `{ "imageIdentifier": "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-123" }`（`imageId` も互換エイリアスとして受理、`imageVersion` は任意）
 - `GET /api/envs/:envId/status`
-  - 登録済みイメージ・稼働中 MicroVM・TTL 期限・Alarm 予定時刻を返却
+  - 登録済みイメージ・稼働中 MicroVM・TTL 期限・Alarm 予定時刻を返却（削除待ちのリソースがあれば `cleanupPending` に含める）
 - `DELETE /api/envs/:envId/destroy`
   - 稼働中 MicroVM 終了・イメージ削除・DO ストレージと Alarm を全削除
+  - 終了・削除に失敗したリソースがある場合は `502`（`{"ok": false, ...}`）を返し、Alarm で自動再試行する
+
+`:envId` はプレビューのサブドメインとして有効な DNS ラベル（英小文字・数字・ハイフン、先頭と末尾は英数字、63 文字以内）に限ります。
+
+## アプリ側の CI 例（GitHub Actions）
+
+[`examples/github-actions/`](examples/github-actions/) に、プレビューしたいアプリ側のリポジトリに置く GitHub Actions の例があります。PR の作成・更新時にイメージを登録し、PR のクローズ時に破棄します。
+
+1. 2 つのファイルをアプリ側リポジトリの `.github/workflows/` にコピーします。
+2. `API_BASE_URL` を本 Worker の管理 API のホスト（`API_HOSTNAME`）に合わせます。
+3. アプリ側リポジトリのシークレットに `CI_WEBHOOK_SECRET` を登録します。
+4. `preview-deploy.yml` のイメージビルド手順（`TODO`）を、実際に MicroVM イメージを作成して ARN を出力する処理に置き換えます。
+
+フォークからの PR ではシークレットが渡らないため、必要に応じてジョブに `if: github.event.pull_request.head.repo.full_name == github.repository` を追加してください。
 
 ## Rails 側の注意点
 
