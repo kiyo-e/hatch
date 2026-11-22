@@ -35,9 +35,13 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 │   ├── auth.ts           # CI Webhook 定数時間シークレット検証 & Cloudflare Access JWT 検証
 │   ├── loading-page.ts   # コールドスタート用 3 秒自動リロード HTML
 │   └── types.ts          # 共通型定義
-├── test/
-│   └── preview-orchestrator.test.mjs  # Node.js 標準テストランナーによる単体テスト
-├── .github/workflows/
+├── test/                 # Node.js 標準テストランナーによるテスト
+│   ├── helpers/register-ts-hooks.mjs  # src/*.ts を直接読み込むためのフック
+│   ├── preview-do.test.mjs            # Durable Object の振る舞い
+│   ├── auth.test.mjs                  # Cloudflare Access JWT 検証
+│   ├── router.test.mjs                # 管理 API の入力検証
+│   └── preview-orchestrator.test.mjs  # 設定・ソースの契約
+├── examples/github-actions/   # アプリ側リポジトリに置く CI の例（このリポジトリでは実行されない）
 │   ├── preview-deploy.yml   # PR 更新時のイメージ登録例
 │   └── preview-cleanup.yml  # PR クローズ時の削除例
 ├── wrangler.jsonc
@@ -125,6 +129,17 @@ Worker に渡す IAM ユーザーには以下のアクションを許可して�
   - 終了・削除に失敗したリソースがある場合は `502`（`{"ok": false, ...}`）を返し、Alarm で自動再試行する
 
 `:envId` はプレビューのサブドメインとして有効な DNS ラベル（英小文字・数字・ハイフン、先頭と末尾は英数字、63 文字以内）に限ります。
+
+## アプリ側の CI 例（GitHub Actions）
+
+[`examples/github-actions/`](examples/github-actions/) に、プレビューしたいアプリ側のリポジトリに置く GitHub Actions の例があります。PR の作成・更新時にイメージを登録し、PR のクローズ時に破棄します。
+
+1. 2 つのファイルをアプリ側リポジトリの `.github/workflows/` にコピーします。
+2. `API_BASE_URL` を本 Worker の管理 API のホスト（`API_HOSTNAME`）に合わせます。
+3. アプリ側リポジトリのシークレットに `CI_WEBHOOK_SECRET` を登録します。
+4. `preview-deploy.yml` のイメージビルド手順（`TODO`）を、実際に MicroVM イメージを作成して ARN を出力する処理に置き換えます。
+
+フォークからの PR ではシークレットが渡らないため、必要に応じてジョブに `if: github.event.pull_request.head.repo.full_name == github.repository` を追加してください。
 
 ## Rails 側の注意点
 
