@@ -106,8 +106,6 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
   private exclusiveChain: Promise<void> = Promise.resolve();
   /** 直列キューに並んでいる登録のイメージ（キューの先のクリーンアップはこれらを削除しない） */
   private readonly registrationIntents = new Map<string, number>();
-  /** 登録待ちのためクリーンアップが削除を見送ったイメージ（登録が失敗したら削除待ちに戻す） */
-  private readonly skippedForRegistration = new Set<string>();
   /** AWS に送信済みで完了待ちのイメージ削除 */
   private imageDeletionInFlight: { imageIdentifier: string; promise: Promise<void> } | null = null;
   private vmStateCheck: {
@@ -135,41 +133,15 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     // キューに並んでいる間、先に実行される破棄・削除の再試行がこのイメージを消さないよう意図を示す
     this.registrationIntents.set(imageIdentifier, (this.registrationIntents.get(imageIdentifier) ?? 0) + 1);
     try {
-      return await this.exclusive(async () => {
-        const wasPending = await this.removeFromPendingCleanup({
-          microvmIds: [],
-          imageIdentifiers: [imageIdentifier],
-        });
-        try {
-          await this.registerImageLocked(imageIdentifier, imageVersion, deletion);
-        } catch (err) {
-          // 登録に失敗したら、外した・見送った削除を元に戻す（登録も削除もされないイメージを残さない）
-          const skipped = wasPending || this.skippedForRegistration.has(imageIdentifier);
-          if (skipped && !(err instanceof ImageDeletedDuringCleanupError)) {
-            await this.restorePendingImage(imageIdentifier);
-          }
-          throw err;
-        }
-      });
+      // 削除待ちからは、登録を確定するときに同時に外す（登録が失敗したら削除待ちのまま残る）
+      return await this.exclusive(() => this.registerImageLocked(imageIdentifier, imageVersion, deletion));
     } finally {
       const count = (this.registrationIntents.get(imageIdentifier) ?? 1) - 1;
       if (count > 0) {
         this.registrationIntents.set(imageIdentifier, count);
       } else {
         this.registrationIntents.delete(imageIdentifier);
-        this.skippedForRegistration.delete(imageIdentifier);
       }
-    }
-  }
-
-  private async restorePendingImage(imageIdentifier: string): Promise<void> {
-    try {
-      const registered = await this.getActiveState();
-      if (registered?.imageIdentifier !== imageIdentifier) {
-        await this.enqueueCleanup({ microvmIds: [], imageIdentifiers: [imageIdentifier] });
-      }
-    } catch (err) {
-      console.error(`[preview-do] failed to restore pending cleanup for ${imageIdentifier}:`, err);
     }
   }
 
@@ -203,6 +175,8 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       { destroyState: false }
     );
     await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
+    // 登録を確定したので削除待ちから外す（外し損ねても、登録済みのイメージはクリーンアップが削除しない）
+    await this.removeFromPendingCleanup({ microvmIds: [], imageIdentifiers: [imageIdentifier] });
     await this.scheduleNextAlarm();
 
     if (current?.microvmId) {
@@ -760,10 +734,8 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       // 直前に削除待ちから外された（再登録された）イメージは消さない
       const latest = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
       if (!latest?.imageIdentifiers.includes(id)) continue;
-      // キューの後ろに同じイメージの登録が並んでいれば削除を見送る（登録が失敗したら削除待ちに戻される）
+      // キューの後ろに同じイメージの登録が並んでいれば削除を見送る（削除待ちには残し、登録の確定時に外れる）
       if (this.registrationIntents.has(id)) {
-        this.skippedForRegistration.add(id);
-        done.imageIdentifiers.push(id);
         continue;
       }
       const registered = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
@@ -790,7 +762,17 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       only && pending ? Math.min(pending.retryAt, nextRetryAt) : nextRetryAt
     );
     await this.scheduleNextAlarm();
-    return (await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP)) ?? null;
+
+    // 登録待ちのため削除を見送ったイメージは失敗として扱わない（登録の確定時に削除待ちから外れる）
+    const remaining = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    if (!remaining) return null;
+    const failed = {
+      ...remaining,
+      imageIdentifiers: remaining.imageIdentifiers.filter((id) => !this.registrationIntents.has(id)),
+    };
+    return failed.microvmIds.length > 0 || failed.imageIdentifiers.length > 0 || failed.destroyState
+      ? failed
+      : null;
   }
 
   private async savePendingCleanup(pending: PendingCleanup): Promise<void> {

@@ -523,7 +523,9 @@ test("destroy が重なっても、先に失敗した削除対象を後続が消
 
 test("削除待ちのイメージの再登録が失敗したら、削除待ちに戻す", async () => {
   const { dObj, ctx } = setup();
-  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
+  const retryAt = Date.now() + 1000;
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt });
+  ctx.alarm = retryAt; // 削除待ちの作成時に設定される Alarm
   const put = ctx.storage.put;
   ctx.storage.put = async (key, value) => {
     if (key === "state") throw new Error("storage unavailable");
@@ -635,6 +637,19 @@ test("登録時の旧 VM 終了では、ほかの削除待ちの再試行時刻�
   await dObj.registerImage("img-v2"); // mvm-1 だけを終了する部分クリーンアップ
   assert.equal(ctx.data.get("pendingCleanup").retryAt, retryAt);
   assert.equal(ctx.alarm, retryAt);
+});
+
+test("再登録が失敗したとき、削除待ちを書き戻せない状況でもイメージを削除待ちに残す", async () => {
+  const { dObj, ctx } = setup();
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
+  const put = ctx.storage.put;
+  ctx.storage.put = async (key, value) => {
+    if (key === "state" || key === "pendingCleanup") throw new Error("storage unavailable");
+    return put(key, value);
+  };
+
+  await assert.rejects(dObj.registerImage("img-a"), /storage unavailable/);
+  assert.deepEqual(ctx.data.get("pendingCleanup").imageIdentifiers, ["img-a"]);
 });
 
 test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
