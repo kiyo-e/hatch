@@ -8,6 +8,7 @@ import "./helpers/register-ts-hooks.mjs";
 
 const { default: worker } = await import("../src/index.ts");
 const { EnvRegistryDO } = await import("../src/registry-do.ts");
+const { previewUrl } = await import("../src/admin.ts");
 
 // --- フェイク ---
 
@@ -187,7 +188,11 @@ test("管理画面: 一覧に台帳の環境と状態を表示し、実体の無
   assert.match(body, /href="\/admin\/envs\/pr-1"/);
   assert.match(body, /稼働中/);
   assert.match(body, /<code title="arn:aws:lambda:[^"]+:pr-1">pr-1<\/code>/, "イメージは ARN の末尾だけを表示する");
-  assert.match(body, /href="http:\/\/pr-1\.localhost:8787\/"/, "プレビューのリンクは今のスキームとポートに合わせる");
+  assert.match(body, /href="http:\/\/pr-1\.localhost:8787\/"/, "ローカルでは http とポートを付ける");
+
+  // wrangler dev（upstream_protocol: https）では Worker から見た URL が https でも、ローカルなら http にする
+  const viaHttpsUpstream = await (await worker.fetch(new Request("https://api.localhost:8787/admin"), env)).text();
+  assert.match(viaHttpsUpstream, /href="http:\/\/pr-1\.localhost:8787\/"/);
   assert.doesNotMatch(body, /pr-2/);
   assert.deepEqual((await registry.list()).map((e) => e.envId), ["pr-1"]);
 });
@@ -346,4 +351,13 @@ test("管理画面: 破棄が済んだあとの台帳の更新に失敗しても
   );
   assert.equal(new URL(res.headers.get("Location"), "http://x").searchParams.get("notice"), "pr-1 を破棄しました");
   assert.equal(statuses["pr-1"].registered, false);
+});
+
+test("プレビューへのリンク: 本番は常に https でポートなし、ローカル（*.localhost）は http でポート付き", () => {
+  const prod = { PREVIEW_BASE_DOMAIN: "preview.example.com" };
+  assert.equal(previewUrl("https://api.preview.example.com/admin", "pr-1", prod), "https://pr-1.preview.example.com/");
+  assert.equal(previewUrl("https://api.preview.example.com:8443/admin", "pr-1", prod), "https://pr-1.preview.example.com/");
+  const local = { PREVIEW_BASE_DOMAIN: "localhost" };
+  assert.equal(previewUrl("https://api.localhost:8787/admin", "pr-1", local), "http://pr-1.localhost:8787/");
+  assert.equal(previewUrl("http://api.localhost/admin", "pr-1", local), "http://pr-1.localhost/");
 });

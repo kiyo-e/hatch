@@ -67,7 +67,16 @@ npm run typecheck
 npm test
 ```
 
-### 2. ドメインと設定の調整
+### 2. ローカルで動かす
+
+```bash
+cp .dev.vars.example .dev.vars
+npm run dev
+```
+
+`.dev.vars` のホスト名（`api.localhost` / `localhost`）が `wrangler.jsonc` の `vars` より優先されるため、管理 API と管理画面は `http://api.localhost:8787`、プレビューは `http://<envId>.localhost:8787` で開けます。AWS の認証情報がダミーのままでも、登録・一覧・管理画面は試せます（MicroVM の起動には本物が必要です）。
+
+### 3. ドメインと設定の調整
 
 `wrangler.jsonc` の `vars` をご自身のドメインに合わせて変更してください。
 
@@ -76,9 +85,9 @@ npm test
 - `AWS_REGION`: MicroVM を稼働させるリージョン（例: `ap-northeast-1`）
 - `APP_TARGET_PORT`: MicroVM 内アプリの待受ポート（例: `8080`）
 
-### 3. シークレットの登録
+### 4. シークレットの登録
 
-ローカル開発時は `.dev.vars.example` を `.dev.vars` にコピーして値を設定します。本番環境では `wrangler secret put` で登録してください。
+本番環境では `wrangler secret put` で登録してください（ローカルでは `.dev.vars`）。
 
 ```bash
 npx wrangler secret put AWS_ACCESS_KEY_ID
@@ -95,13 +104,13 @@ npx wrangler secret put CF_ACCESS_AUD
 npx wrangler secret put CF_ACCESS_ADMIN_AUD
 ```
 
-### 4. デプロイ
+### 5. デプロイ
+
+ホスト名で振り分けるため、`workers.dev` とプレビュー URL は無効にしています（`workers_dev: false` / `preview_urls: false`）。`wrangler.jsonc` の `routes` のコメントを外してドメインを書き換えるか、Cloudflare ダッシュボードで、`api.preview.example.com/*` と `*.preview.example.com/*` を本 Worker に紐付けてください。
 
 ```bash
 npm run deploy
 ```
-
-Cloudflare ダッシュボードまたは `wrangler.jsonc` の `routes` で、`*.preview.example.com/*` と `api.preview.example.com/*` を本 Worker に紐付けてください。
 
 ## 必要な AWS IAM ポリシー（最小権限の例）
 
@@ -185,8 +194,4 @@ config.action_cable.allowed_request_origins = [%r{\Ahttps://[a-z0-9-]+\.preview\
 
 ### `wrangler dev` で試す場合
 
-`wrangler dev` はリクエストの `Origin` / `Referer` などのヘッダーに含まれる URL を、内部の URL（既定では `http://`）に書き換えます。そのままでは Rails に `Origin: http://...` が届き、`base_url`（`https://...`）と一致しないため、CSRF 検証と ActionCable が失敗します。ローカルで試すときは `--upstream-protocol https` を付けてください（レスポンスの `Location` は `http://` に書き換えられますが、本番では起きません）。
-
-```bash
-npx wrangler dev --upstream-protocol https
-```
+`wrangler dev` はリクエストの `Origin` / `Referer` などのヘッダーに含まれる URL を、内部の URL（既定では `http://`）に書き換えます。そのままでは Rails に `Origin: http://...` が届き、`base_url`（`https://...`）と一致しないため、CSRF 検証と ActionCable が失敗します。このため `wrangler.jsonc` で `dev.upstream_protocol` を `https` にしています（レスポンスの `Location` は `http://` に書き換えられますが、本番では起きません）。
