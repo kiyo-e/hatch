@@ -34,9 +34,14 @@ async function sign(key, claims = {}, header = {}) {
 
 let publishedKeys = [];
 let jwksFetches = 0;
+let jwksFailNext = false;
 globalThis.fetch = async (url) => {
   assert.equal(String(url), `https://${TEAM}/cdn-cgi/access/certs`);
   jwksFetches++;
+  if (jwksFailNext) {
+    jwksFailNext = false;
+    return new Response("unavailable", { status: 503 });
+  }
   return Response.json({ keys: publishedKeys.map((k) => k.jwk) });
 };
 
@@ -95,4 +100,15 @@ test("環境変数が両方未設定なら素通し、片方だけなら設定�
   assert.deepEqual(await verify(null, {}), { ok: true });
   assert.equal((await verify("garbage", { CF_ACCESS_AUD: AUD })).status, 500);
   assert.equal((await verify("garbage", { CF_ACCESS_TEAM_DOMAIN: TEAM })).status, 500);
+});
+
+test("鍵ローテーション時の JWKS 再取得が一時的に失敗しても、次のリクエストで再取得する", async (t) => {
+  // 間隔制限はモジュール全体で共有されるため、前のテストの再取得から時間を進めておく
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 2 * 60 * 1000 });
+  await verify(await sign(k1)); // k1 だけの JWKS をキャッシュ
+  const k0 = await makeKey("k0");
+  publishedKeys = [k1, k0];
+  jwksFailNext = true;
+  assert.equal((await verify(await sign(k0))).status, 401, "再取得に失敗したリクエストは 401");
+  assert.deepEqual(await verify(await sign(k0)), { ok: true }, "次のリクエストは間隔制限にかからず再取得する");
 });

@@ -89,10 +89,17 @@ async function findAccessJwk(teamDomain: string, kid: string | undefined): Promi
     if (now - lastForcedJwksRefreshAt < JWKS_FORCE_REFRESH_MIN_INTERVAL_MS) {
       return undefined;
     }
+    const previousRefreshAt = lastForcedJwksRefreshAt;
     lastForcedJwksRefreshAt = now;
-    const refresh: Promise<JwkKey[]> = fetchAccessJwks(teamDomain, true).finally(() => {
-      if (forcedJwksRefresh === refresh) forcedJwksRefresh = null;
-    });
+    const refresh: Promise<JwkKey[]> = fetchAccessJwks(teamDomain, true)
+      .catch((err: unknown) => {
+        // 取得に失敗したら間隔制限を戻し、次のリクエストで再取得できるようにする
+        if (lastForcedJwksRefreshAt === now) lastForcedJwksRefreshAt = previousRefreshAt;
+        throw err;
+      })
+      .finally(() => {
+        if (forcedJwksRefresh === refresh) forcedJwksRefresh = null;
+      });
     forcedJwksRefresh = refresh;
   }
   const refreshed = await forcedJwksRefresh;
