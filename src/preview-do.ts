@@ -1,10 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
-import { AwsMicroVmClient, type MicroVmClient } from "./aws-microvm";
-import { acceptsHtmlBrowserRequest, renderColdStartResponse } from "./loading-page";
+import { AwsMicroVmClient, normalizeEndpointUrl, type MicroVmClient } from "./aws-microvm";
+import {
+  acceptsHtmlBrowserRequest,
+  renderBootFailedResponse,
+  renderColdStartResponse,
+} from "./loading-page";
 import type {
   ActiveVmState,
   CachedJweToken,
   Env,
+  MicroVmLifecycleState,
+  PendingCleanup,
   PersistedVmState,
   PreviewStatusResponse,
 } from "./types";
@@ -19,6 +25,16 @@ const MAX_IDLE_DURATION_SECONDS = 300;
 const SUSPENDED_DURATION_SECONDS = 28800;
 const DEFAULT_ZOMBIE_TTL_DAYS = 14;
 const STORAGE_KEY_STATE = "state";
+const STORAGE_KEY_PENDING_CLEANUP = "pendingCleanup";
+// 起動中に再登録が続いた場合に起動をやり直す最大回数
+const MAX_BOOT_ATTEMPTS = 3;
+// RunMicrovm 失敗後、次の起動を試みるまでの待機時間（リロードのたびに AWS を叩かないため）
+export const BOOT_FAILURE_BACKOFF_MS = 30 * 1000;
+// アプリ自身が返す 403 / 404 / 502 のたびに AWS API を呼ばないための間隔
+export const TOKEN_FORCE_REFRESH_INTERVAL_MS = 30 * 1000;
+export const VM_STATE_CHECK_INTERVAL_MS = 30 * 1000;
+// 破棄に失敗した MicroVM / イメージの再削除間隔
+export const CLEANUP_RETRY_DELAY_MS = 10 * 60 * 1000;
 
 export class NoImageRegisteredError extends Error {
   constructor() {
@@ -37,14 +53,48 @@ export class StaleBootError extends Error {
   }
 }
 
-// 起動中に再登録が続いた場合に起動をやり直す最大回数
-const MAX_BOOT_ATTEMPTS = 3;
+/**
+ * 直近の起動失敗から BOOT_FAILURE_BACKOFF_MS 経過していないため起動を見送ったことを示す。
+ */
+export class BootBackoffError extends Error {
+  readonly retryAfterSeconds: number;
+
+  constructor(retryAfterSeconds: number) {
+    super("MicroVM failed to start recently; retrying later.");
+    this.name = "BootBackoffError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+/**
+ * destroy で MicroVM の終了またはイメージの削除に失敗したことを示す（Alarm で自動再試行される）。
+ */
+export class CleanupIncompleteError extends Error {
+  readonly pending: PendingCleanup;
+
+  constructor(pending: PendingCleanup) {
+    super(
+      `Cleanup incomplete (microvms: ${pending.microvmIds.join(",") || "-"}, images: ${
+        pending.imageIdentifiers.join(",") || "-"
+      }); it will be retried automatically.`
+    );
+    this.name = "CleanupIncompleteError";
+    this.pending = pending;
+  }
+}
 
 export class PreviewEnvironmentDO extends DurableObject<Env> {
   private readonly aws: MicroVmClient;
   private bootPromise: Promise<ActiveVmState> | null = null;
+  private lastBootFailureAt: number | null = null;
   private cachedToken: CachedJweToken | null = null;
   private tokenPromise: { microvmId: string; promise: Promise<string> } | null = null;
+  private lastForcedTokenRefresh: { microvmId: string; at: number } | null = null;
+  private vmStateCheck: {
+    microvmId: string;
+    at: number;
+    promise: Promise<MicroVmLifecycleState>;
+  } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env, awsClient?: MicroVmClient) {
     super(ctx, env);
@@ -64,37 +114,71 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     // 起動中の bootPromise は破棄する（完了時に generation 不一致を検出して自ら VM を終了する）
     this.resetInMemoryState();
 
+    const now = Date.now();
     const nextState: PersistedVmState = {
       imageIdentifier,
       imageVersion,
       generation: crypto.randomUUID(),
-      updatedAt: Date.now(),
+      zombieAt: now + this.getZombieTtlMs(),
+      updatedAt: now,
     };
     await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, nextState);
-    await this.scheduleZombieCleanupAlarm();
+
+    // 削除待ちのイメージと同じものが再登録された場合は削除対象から外す
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    if (pending?.imageIdentifiers.includes(imageIdentifier)) {
+      await this.savePendingCleanup({
+        ...pending,
+        imageIdentifiers: pending.imageIdentifiers.filter((id) => id !== imageIdentifier),
+      });
+    }
+
+    await this.scheduleNextAlarm();
   }
 
   /**
    * PR クローズ時または DO Alarm 発火時の完全クリーンアップ。
+   * MicroVM の終了・イメージ削除に失敗した場合は削除待ちとして記録し、Alarm で再試行したうえで
+   * CleanupIncompleteError を投げる（呼び出し元の CI が失敗として検知できるようにする）。
    */
   async destroy(): Promise<void> {
     const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-    if (current?.microvmId) {
-      await this.aws.terminateMicroVm(current.microvmId).catch(() => {});
-    }
-    if (current?.imageIdentifier) {
-      await this.aws.deleteMicroVmImage(current.imageIdentifier).catch(() => {});
-    }
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+
+    // 先に状態を消し、AWS 呼び出し中に来たアクセスで再起動されないようにする
     this.resetInMemoryState();
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.delete(STORAGE_KEY_STATE);
+
+    await this.runCleanup({
+      microvmIds: uniq([current?.microvmId, ...(pending?.microvmIds ?? [])]),
+      imageIdentifiers: uniq([current?.imageIdentifier, ...(pending?.imageIdentifiers ?? [])]),
+    });
   }
 
   /**
-   * 放置 PR（Webhook 取りこぼし等）のゾンビイメージを自動掃除する Alarm ハンドラ。
+   * DO Alarm ハンドラ。
+   * - 放置 PR（Webhook 取りこぼし等）のゾンビイメージを自動掃除する
+   * - 破棄に失敗した MicroVM / イメージの削除を再試行する
    */
   async alarm(): Promise<void> {
-    await this.destroy();
+    try {
+      const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+      // zombieAt を持たない旧バージョンの状態は、従来どおり Alarm 発火 = 掃除期限とみなす
+      if (state && (state.zombieAt === undefined || state.zombieAt <= Date.now())) {
+        await this.destroy();
+        return;
+      }
+
+      const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+      if (pending) {
+        await this.runCleanup(pending);
+      } else {
+        await this.scheduleNextAlarm();
+      }
+    } catch (err) {
+      // 失敗分は runCleanup が削除待ちとして記録し、次の Alarm を設定済み
+      console.error("[preview-do] alarm cleanup incomplete:", err);
+    }
   }
 
   /**
@@ -102,10 +186,20 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
    */
   async getStatus(): Promise<PreviewStatusResponse> {
     const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
     const alarmMs = await this.ctx.storage.getAlarm();
+    const cleanup = pending
+      ? {
+          cleanupPending: {
+            microvmIds: pending.microvmIds,
+            imageIdentifiers: pending.imageIdentifiers,
+          },
+          alarmAt: alarmMs ? new Date(alarmMs).toISOString() : undefined,
+        }
+      : {};
 
     if (!state?.imageIdentifier) {
-      return { registered: false, booting: false };
+      return { registered: false, booting: false, ...cleanup };
     }
 
     return {
@@ -119,6 +213,7 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
         ? new Date(state.createdAt + MAX_VM_LIFETIME_MS).toISOString()
         : undefined,
       alarmAt: alarmMs ? new Date(alarmMs).toISOString() : undefined,
+      ...cleanup,
     };
   }
 
@@ -131,32 +226,55 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       return new Response("Preview environment is not built yet.", { status: 404 });
     }
 
+    const hostLabel = new URL(request.url).hostname;
+
     // コールドスタート UX 改善: 起動が必要かつブラウザの HTML リクエストなら即座に自動リロード画面を返す
     if (
       !this.isVmAlive(state) &&
       this.env.COLD_START_LOADING_PAGE === "true" &&
       acceptsHtmlBrowserRequest(request)
     ) {
+      // 直近で起動に失敗していたら「起動中」を出し続けず、失敗画面を返す
+      const backoffSeconds = this.bootBackoffRemainingSeconds();
+      if (backoffSeconds > 0) {
+        return renderBootFailedResponse(hostLabel, backoffSeconds);
+      }
       this.ctx.waitUntil(this.ensureRunningMicroVm().catch(() => {}));
-      const hostLabel = new URL(request.url).hostname;
       return renderColdStartResponse(hostLabel, 3);
     }
 
-    let vm: ActiveVmState;
     try {
-      vm = await this.ensureRunningMicroVm();
+      return await this.proxyWithRecovery(request);
     } catch (err) {
       if (err instanceof NoImageRegisteredError) {
         return new Response(err.message, { status: 404 });
       }
-      return new Response(`Failed to start MicroVM: ${(err as Error).message}`, { status: 502 });
+      // AWS のエラー内容は未認証の閲覧者に見せず、ログにのみ残す
+      console.error(`[preview-do] ${hostLabel}: failed to serve request:`, err);
+      const retryAfter = err instanceof BootBackoffError ? err.retryAfterSeconds : 5;
+      if (acceptsHtmlBrowserRequest(request)) {
+        return renderBootFailedResponse(hostLabel, retryAfter);
+      }
+      return new Response("Preview environment is temporarily unavailable.", {
+        status: 502,
+        headers: { "Retry-After": String(retryAfter), "Cache-Control": "no-store" },
+      });
     }
+  }
 
+  private async proxyWithRecovery(request: Request): Promise<Response> {
+    const vm = await this.ensureRunningMicroVm();
     let token = await this.getValidJweToken(vm.microvmId);
     let response = await this.proxyToMicroVm(request, vm.endpointUrl, token);
 
-    // トークンが想定外に失効していた場合（403）はトークンを再発行して 1 回リトライ
-    if (response.status === 403 && this.canRetryRequest(request)) {
+    // トークンが想定外に失効していた場合（403）はトークンを再発行して 1 回リトライ。
+    // アプリ自身の 403 で毎回発行しないよう、強制再発行は VM ごとに一定間隔に 1 回まで
+    if (
+      response.status === 403 &&
+      this.canRetryRequest(request) &&
+      this.claimForcedTokenRefresh(vm.microvmId)
+    ) {
+      await response.body?.cancel();
       this.cachedToken = null;
       token = await this.getValidJweToken(vm.microvmId);
       response = await this.proxyToMicroVm(request, vm.endpointUrl, token);
@@ -167,9 +285,10 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       (response.status === 410 || response.status === 404 || response.status === 502) &&
       this.canRetryRequest(request)
     ) {
-      const vmState = await this.aws.getMicroVmState(vm.microvmId);
+      const vmState = await this.checkVmState(vm.microvmId);
       if (vmState === "TERMINATED" || vmState === "TERMINATING" || vmState === "NOT_FOUND") {
-        await this.invalidateVmInstance();
+        await response.body?.cancel();
+        await this.invalidateVmInstance(vm.microvmId);
         const freshVm = await this.ensureRunningMicroVm();
         const freshToken = await this.getValidJweToken(freshVm.microvmId);
         response = await this.proxyToMicroVm(request, freshVm.endpointUrl, freshToken);
@@ -221,21 +340,48 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
 
   private startOrJoinBoot(state: PersistedVmState): Promise<ActiveVmState> {
     if (!this.bootPromise) {
-      const boot: Promise<ActiveVmState> = this.provisionNewMicroVm(state).finally(() => {
-        // registerImage / destroy 後に始まった別の起動のロックを解放しないよう、自分自身の場合のみ解除
-        if (this.bootPromise === boot) {
-          this.bootPromise = null;
-        }
-      });
+      const backoffSeconds = this.bootBackoffRemainingSeconds();
+      if (backoffSeconds > 0) {
+        return Promise.reject(new BootBackoffError(backoffSeconds));
+      }
+
+      const boot: Promise<ActiveVmState> = this.provisionNewMicroVm(state)
+        .then(
+          (vm) => {
+            if (this.bootPromise === boot) this.lastBootFailureAt = null;
+            return vm;
+          },
+          (err: unknown) => {
+            if (this.bootPromise === boot && !(err instanceof StaleBootError)) {
+              this.lastBootFailureAt = Date.now();
+            }
+            throw err;
+          }
+        )
+        .finally(() => {
+          // registerImage / destroy 後に始まった別の起動のロックを解放しないよう、自分自身の場合のみ解除
+          if (this.bootPromise === boot) {
+            this.bootPromise = null;
+          }
+        });
       this.bootPromise = boot;
     }
     return this.bootPromise;
+  }
+
+  private bootBackoffRemainingSeconds(): number {
+    if (this.lastBootFailureAt === null) return 0;
+    const remainingMs = this.lastBootFailureAt + BOOT_FAILURE_BACKOFF_MS - Date.now();
+    return remainingMs > 0 ? Math.ceil(remainingMs / 1000) : 0;
   }
 
   private resetInMemoryState(): void {
     this.cachedToken = null;
     this.tokenPromise = null;
     this.bootPromise = null;
+    this.lastBootFailureAt = null;
+    this.lastForcedTokenRefresh = null;
+    this.vmStateCheck = null;
   }
 
   private async provisionNewMicroVm(state: PersistedVmState): Promise<ActiveVmState> {
@@ -259,6 +405,8 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       maximumDurationInSeconds: 28800,
       executionRoleArn: this.env.AWS_MICROVM_EXECUTION_ROLE_ARN,
       egressNetworkConnectors: egressConnectors,
+      // aws4fetch は 5xx / 429 で自動リトライするため、重複起動しないよう冪等トークンを付ける
+      clientToken: crypto.randomUUID(),
     });
 
     // RunMicrovm 待ちの間に registerImage / destroy が走っていたら、起動結果を書き戻さずに VM を終了する
@@ -276,9 +424,7 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
 
     const now = Date.now();
     const nextState: ActiveVmState = {
-      imageIdentifier: state.imageIdentifier,
-      imageVersion: state.imageVersion,
-      generation: state.generation,
+      ...latest,
       microvmId: started.microvmId,
       endpointUrl: started.endpointUrl,
       createdAt: now,
@@ -289,18 +435,49 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     return nextState;
   }
 
-  private async invalidateVmInstance(): Promise<void> {
+  /**
+   * 停止を確認した MicroVM の記録を消す。並行リクエストが既に新しい VM を起動・保存していた場合は
+   * その記録を消さないよう、保存中の microvmId が一致するときだけ消す。
+   */
+  private async invalidateVmInstance(deadMicrovmId: string): Promise<void> {
+    if (this.cachedToken?.microvmId === deadMicrovmId) this.cachedToken = null;
+    if (this.tokenPromise?.microvmId === deadMicrovmId) this.tokenPromise = null;
+
     const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
-    this.cachedToken = null;
-    this.tokenPromise = null;
-    if (state?.imageIdentifier) {
+    if (state?.imageIdentifier && state.microvmId === deadMicrovmId) {
+      const { microvmId: _id, endpointUrl: _url, createdAt: _at, ...rest } = state;
       await this.ctx.storage.put<PersistedVmState>(STORAGE_KEY_STATE, {
-        imageIdentifier: state.imageIdentifier,
-        imageVersion: state.imageVersion,
-        generation: state.generation,
+        ...rest,
         updatedAt: Date.now(),
       });
     }
+  }
+
+  /**
+   * GetMicrovm の結果を VM ごとに一定時間共有する（同時リクエストやアプリ自身の 404 で連打しない）。
+   */
+  private checkVmState(microvmId: string): Promise<MicroVmLifecycleState> {
+    const cached = this.vmStateCheck;
+    if (
+      cached &&
+      cached.microvmId === microvmId &&
+      Date.now() - cached.at < VM_STATE_CHECK_INTERVAL_MS
+    ) {
+      return cached.promise;
+    }
+    const promise = this.aws.getMicroVmState(microvmId).catch(() => "UNKNOWN" as const);
+    this.vmStateCheck = { microvmId, at: Date.now(), promise };
+    return promise;
+  }
+
+  private claimForcedTokenRefresh(microvmId: string): boolean {
+    const last = this.lastForcedTokenRefresh;
+    const now = Date.now();
+    if (last && last.microvmId === microvmId && now - last.at < TOKEN_FORCE_REFRESH_INTERVAL_MS) {
+      return false;
+    }
+    this.lastForcedTokenRefresh = { microvmId, at: now };
+    return true;
   }
 
   /**
@@ -354,10 +531,70 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     return Number.isFinite(parsed) && parsed > 0 && parsed <= 65535 ? parsed : 8080;
   }
 
-  private async scheduleZombieCleanupAlarm(): Promise<void> {
+  private getZombieTtlMs(): number {
     const days = Number.parseInt(this.env.ZOMBIE_TTL_DAYS || String(DEFAULT_ZOMBIE_TTL_DAYS), 10);
     const ttlDays = Number.isFinite(days) && days > 0 ? days : DEFAULT_ZOMBIE_TTL_DAYS;
-    await this.ctx.storage.setAlarm(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+    return ttlDays * 24 * 60 * 60 * 1000;
+  }
+
+  /**
+   * MicroVM の終了とイメージの削除を行い、失敗分は削除待ちとして記録して Alarm で再試行する。
+   */
+  private async runCleanup(targets: Omit<PendingCleanup, "retryAt">): Promise<void> {
+    const failed: Omit<PendingCleanup, "retryAt"> = { microvmIds: [], imageIdentifiers: [] };
+
+    for (const id of targets.microvmIds) {
+      try {
+        await this.aws.terminateMicroVm(id);
+      } catch (err) {
+        console.error(`[preview-do] TerminateMicrovm(${id}) failed:`, err);
+        failed.microvmIds.push(id);
+      }
+    }
+    for (const id of targets.imageIdentifiers) {
+      try {
+        await this.aws.deleteMicroVmImage(id);
+      } catch (err) {
+        console.error(`[preview-do] DeleteMicrovmImage(${id}) failed:`, err);
+        failed.imageIdentifiers.push(id);
+      }
+    }
+
+    // 処理中に同じイメージが再登録されていたら、そのイメージは消さずに残す
+    const current = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+    if (current?.imageIdentifier) {
+      failed.imageIdentifiers = failed.imageIdentifiers.filter((id) => id !== current.imageIdentifier);
+    }
+
+    const pending: PendingCleanup = { ...failed, retryAt: Date.now() + CLEANUP_RETRY_DELAY_MS };
+    await this.savePendingCleanup(pending);
+    await this.scheduleNextAlarm();
+
+    if (pending.microvmIds.length > 0 || pending.imageIdentifiers.length > 0) {
+      throw new CleanupIncompleteError(pending);
+    }
+  }
+
+  private async savePendingCleanup(pending: PendingCleanup): Promise<void> {
+    if (pending.microvmIds.length === 0 && pending.imageIdentifiers.length === 0) {
+      await this.ctx.storage.delete(STORAGE_KEY_PENDING_CLEANUP);
+    } else {
+      await this.ctx.storage.put<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP, pending);
+    }
+  }
+
+  /**
+   * ゾンビ掃除期限と削除待ちの再試行時刻のうち、早いほうに Alarm を設定する。
+   */
+  private async scheduleNextAlarm(): Promise<void> {
+    const state = await this.ctx.storage.get<PersistedVmState>(STORAGE_KEY_STATE);
+    const pending = await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP);
+    const times = [state?.zombieAt, pending?.retryAt].filter((t): t is number => typeof t === "number");
+    if (times.length > 0) {
+      await this.ctx.storage.setAlarm(Math.min(...times));
+    } else {
+      await this.ctx.storage.deleteAlarm();
+    }
   }
 
   /**
@@ -370,7 +607,7 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
     jweToken: string
   ): Promise<Response> {
     const incomingUrl = new URL(incomingRequest.url);
-    const targetUrl = new URL(endpointUrl);
+    const targetUrl = new URL(normalizeEndpointUrl(endpointUrl));
     targetUrl.pathname = incomingUrl.pathname;
     targetUrl.search = incomingUrl.search;
 
@@ -396,4 +633,8 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
 
     return fetch(proxyReq);
   }
+}
+
+function uniq(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((v): v is string => Boolean(v)))];
 }

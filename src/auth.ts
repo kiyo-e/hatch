@@ -48,9 +48,18 @@ function base64UrlDecode(input: string): Uint8Array {
   return bytes;
 }
 
-async function fetchAccessJwks(teamDomain: string): Promise<JwkKey[]> {
+// 未知の kid による JWKS 強制再取得の最短間隔（ランダムな kid で JWKS 取得を連打させないため）
+const JWKS_FORCE_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
+let lastForcedJwksRefreshAt = 0;
+
+async function fetchAccessJwks(teamDomain: string, forceRefresh = false): Promise<JwkKey[]> {
   const now = Date.now();
-  if (jwksCache && jwksCache.domain === teamDomain && now - jwksCache.fetchedAt < JWKS_CACHE_TTL_MS) {
+  if (
+    !forceRefresh &&
+    jwksCache &&
+    jwksCache.domain === teamDomain &&
+    now - jwksCache.fetchedAt < JWKS_CACHE_TTL_MS
+  ) {
     return jwksCache.keys;
   }
 
@@ -64,16 +73,41 @@ async function fetchAccessJwks(teamDomain: string): Promise<JwkKey[]> {
 }
 
 /**
+ * kid に一致する鍵を探す。見つからなければ鍵ローテーションの可能性があるため、
+ * 一定間隔に 1 回まで JWKS を再取得して探し直す。
+ */
+async function findAccessJwk(teamDomain: string, kid: string | undefined): Promise<JwkKey | undefined> {
+  if (!kid) return undefined;
+  const cached = await fetchAccessJwks(teamDomain);
+  const hit = cached.find((k) => k.kid === kid);
+  if (hit) return hit;
+
+  const now = Date.now();
+  if (now - lastForcedJwksRefreshAt < JWKS_FORCE_REFRESH_MIN_INTERVAL_MS) {
+    return undefined;
+  }
+  lastForcedJwksRefreshAt = now;
+  const refreshed = await fetchAccessJwks(teamDomain, true);
+  return refreshed.find((k) => k.kid === kid);
+}
+
+/**
  * Cloudflare Access JWT (CF-Access-Jwt-Assertion) の検証。
- * CF_ACCESS_TEAM_DOMAIN と CF_ACCESS_AUD が両方設定されている場合のみ強制する。
- * 未設定の場合はパススルー（別途 Cloudflare Access / GitHub OAuth 等で保護する前提）。
+ * CF_ACCESS_TEAM_DOMAIN と CF_ACCESS_AUD が両方設定されている場合に強制する。
+ * 両方未設定の場合はパススルー（別途 Cloudflare Access / GitHub OAuth 等で保護する前提）。
+ * 片方だけ設定されている場合は設定ミスとして 500 を返す。
  */
 export async function verifyPreviewAccess(
   request: Request,
   env: Pick<Env, "CF_ACCESS_TEAM_DOMAIN" | "CF_ACCESS_AUD">
 ): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
-  if (!env.CF_ACCESS_TEAM_DOMAIN || !env.CF_ACCESS_AUD) {
+  if (!env.CF_ACCESS_TEAM_DOMAIN && !env.CF_ACCESS_AUD) {
     return { ok: true };
+  }
+  // 片方だけ設定されている場合は設定ミスとみなし、認証なしで素通しさせない（fail closed）
+  if (!env.CF_ACCESS_TEAM_DOMAIN || !env.CF_ACCESS_AUD) {
+    console.error("[auth] Both CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set to enable Cloudflare Access verification");
+    return { ok: false, status: 500, message: "Cloudflare Access verification is misconfigured" };
   }
 
   const token =
@@ -95,21 +129,33 @@ export async function verifyPreviewAccess(
       alg?: string;
     };
     const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]))) as {
-      aud?: string[];
+      aud?: string[] | string;
       exp?: number;
+      nbf?: number;
       iss?: string;
     };
+
+    if (header.alg !== "RS256") {
+      return { ok: false, status: 401, message: "Unsupported JWT algorithm" };
+    }
 
     const nowSec = Math.floor(Date.now() / 1000);
     if (!payload.exp || payload.exp <= nowSec) {
       return { ok: false, status: 401, message: "Access token expired" };
     }
-    if (!payload.aud || !payload.aud.includes(env.CF_ACCESS_AUD)) {
+    if (payload.nbf && payload.nbf > nowSec + 60) {
+      return { ok: false, status: 401, message: "Access token not yet valid" };
+    }
+    // aud は配列または文字列（JWT 仕様）。文字列の部分一致にならないよう配列に揃えて完全一致で比較する
+    const audiences = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+    if (!audiences.includes(env.CF_ACCESS_AUD)) {
       return { ok: false, status: 403, message: "Invalid Access audience" };
     }
+    if (payload.iss !== `https://${env.CF_ACCESS_TEAM_DOMAIN}`) {
+      return { ok: false, status: 401, message: "Invalid Access issuer" };
+    }
 
-    const keys = await fetchAccessJwks(env.CF_ACCESS_TEAM_DOMAIN);
-    const jwk = keys.find((k) => k.kid === header.kid);
+    const jwk = await findAccessJwk(env.CF_ACCESS_TEAM_DOMAIN, header.kid);
     if (!jwk) {
       return { ok: false, status: 401, message: "Unknown signing key" };
     }

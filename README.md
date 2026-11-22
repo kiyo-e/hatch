@@ -9,7 +9,7 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 - **自己修復リトライ**: 寿命内でも AWS 側で `TERMINATED` / `NOT_FOUND` になっていた場合は `GetMicrovm` で状態確認のうえ 1 回だけ再起動リトライします。トークン失効（403）時は JWE トークンを再発行してリトライします。
 - **HTTP / WebSocket 透過プロキシ**: `X-aws-proxy-auth`（JWE）と `X-aws-proxy-port` を自動付与し、ActionCable 等の `Upgrade: websocket` リクエストも同じコードパスで転送します。
 - **コールドスタート UX 改善**: `COLD_START_LOADING_PAGE=true` の場合、起動中のブラウザリクエスト（`Accept: text/html`）には 3 秒自動リロードの軽量 HTML（HTTP 503 + `Retry-After: 3`）を即返し、バックグラウンドで起動を完了させます。
-- **DO Alarm によるゾンビイメージ掃除**: `registerImage` 時に `ZOMBIE_TTL_DAYS`（既定 14 日）後の Alarm を設定し、PR クローズ Webhook が取りこぼされても `destroy()` で自動削除します。
+- **DO Alarm によるゾンビイメージ掃除**: `registerImage` 時に `ZOMBIE_TTL_DAYS`（既定 14 日）後の Alarm を設定し、PR クローズ Webhook が取りこぼされても `destroy()` で自動削除します。`destroy` で MicroVM の終了やイメージの削除に失敗した分は削除待ちとして記録し、10 分後の Alarm で再試行します。
 
 ## 公式 API 仕様への準拠ポイント
 
@@ -76,7 +76,7 @@ npx wrangler secret put AWS_ACCESS_KEY_ID
 npx wrangler secret put AWS_SECRET_ACCESS_KEY
 npx wrangler secret put CI_WEBHOOK_SECRET
 
-# 任意: Cloudflare Access JWT 検証を有効化する場合
+# 任意: Cloudflare Access JWT 検証を有効化する場合（2 つとも設定してください。片方だけの場合はプレビューへのアクセスを 500 で拒否します）
 npx wrangler secret put CF_ACCESS_TEAM_DOMAIN
 npx wrangler secret put CF_ACCESS_AUD
 ```
@@ -119,9 +119,12 @@ Worker に渡す IAM ユーザーには以下のアクションを許可して�
 - `POST /api/envs/:envId/register`
   - Body: `{ "imageIdentifier": "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-123" }`（`imageId` も互換エイリアスとして受理、`imageVersion` は任意）
 - `GET /api/envs/:envId/status`
-  - 登録済みイメージ・稼働中 MicroVM・TTL 期限・Alarm 予定時刻を返却
+  - 登録済みイメージ・稼働中 MicroVM・TTL 期限・Alarm 予定時刻を返却（削除待ちのリソースがあれば `cleanupPending` に含める）
 - `DELETE /api/envs/:envId/destroy`
   - 稼働中 MicroVM 終了・イメージ削除・DO ストレージと Alarm を全削除
+  - 終了・削除に失敗したリソースがある場合は `502`（`{"ok": false, ...}`）を返し、Alarm で自動再試行する
+
+`:envId` はプレビューのサブドメインとして有効な DNS ラベル（英小文字・数字・ハイフン、先頭と末尾は英数字、63 文字以内）に限ります。
 
 ## Rails 側の注意点
 

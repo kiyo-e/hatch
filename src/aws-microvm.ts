@@ -41,6 +41,16 @@ export interface MicroVmClient {
 }
 
 /**
+ * RunMicrovm の `endpoint` を URL に正規化する。
+ * 公式ドキュメントは「HTTPS endpoint URL」と説明する一方、例示はスキームなしのホスト名
+ * （例: abc123def456.lambda-microvm.us-east-1.on.aws）のため、どちらの形式でも扱えるようにする。
+ */
+export function normalizeEndpointUrl(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+/**
  * AWS Lambda MicroVMs API (/2025-09-09/) の SigV4 クライアントラッパー。
  * Cloudflare Workers バンドルサイズを抑えるため aws4fetch を使用。
  */
@@ -108,7 +118,7 @@ export class AwsMicroVmClient implements MicroVmClient {
 
     return {
       microvmId: data.microvmId,
-      endpointUrl: data.endpoint,
+      endpointUrl: normalizeEndpointUrl(data.endpoint),
       state: data.state,
     };
   }

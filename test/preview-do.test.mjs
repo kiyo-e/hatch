@@ -1,38 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { registerHooks } from "node:module";
+import "./helpers/register-ts-hooks.mjs";
 
 /**
  * src/preview-do.ts を Node.js の型ストリッピングで直接読み込み、
  * インメモリのストレージと AWS クライアントのフェイクで Durable Object の振る舞いを検証する。
  */
 
-const CF_WORKERS_STUB = "stub:cloudflare-workers";
-
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (specifier === "cloudflare:workers") {
-      return { url: CF_WORKERS_STUB, shortCircuit: true };
-    }
-    // src 内の拡張子なし相対 import（"./aws-microvm" 等）を .ts に解決する
-    if (specifier.startsWith(".") && context.parentURL?.endsWith(".ts") && !/\.[cm]?[jt]s$/.test(specifier)) {
-      return nextResolve(`${specifier}.ts`, context);
-    }
-    return nextResolve(specifier, context);
-  },
-  load(url, context, nextLoad) {
-    if (url === CF_WORKERS_STUB) {
-      return {
-        format: "module",
-        shortCircuit: true,
-        source: "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }",
-      };
-    }
-    return nextLoad(url, context);
-  },
-});
-
-const { PreviewEnvironmentDO } = await import("../src/preview-do.ts");
+const {
+  PreviewEnvironmentDO,
+  MAX_VM_LIFETIME_MS,
+  BOOT_FAILURE_BACKOFF_MS,
+  CLEANUP_RETRY_DELAY_MS,
+} = await import("../src/preview-do.ts");
+const { normalizeEndpointUrl } = await import("../src/aws-microvm.ts");
+const { acceptsHtmlBrowserRequest } = await import("../src/loading-page.ts");
 
 function deferred() {
   let resolve;
@@ -42,13 +24,16 @@ function deferred() {
 
 function createCtx() {
   const data = new Map();
-  let alarm = null;
   const waits = [];
-  return {
+  const ctx = {
     data,
     waits,
+    alarm: null,
     waitUntil(p) {
       waits.push(p);
+    },
+    async settle() {
+      while (waits.length > 0) await Promise.all(waits.splice(0));
     },
     storage: {
       async get(key) {
@@ -57,20 +42,24 @@ function createCtx() {
       async put(key, value) {
         data.set(key, structuredClone(value));
       },
+      async delete(key) {
+        return data.delete(key);
+      },
       async deleteAll() {
         data.clear();
       },
       async setAlarm(ms) {
-        alarm = ms;
+        ctx.alarm = ms;
       },
       async getAlarm() {
-        return alarm;
+        return ctx.alarm;
       },
       async deleteAlarm() {
-        alarm = null;
+        ctx.alarm = null;
       },
     },
   };
+  return ctx;
 }
 
 function createFakeAws() {
@@ -80,19 +69,32 @@ function createFakeAws() {
     terminated: [],
     /** 設定すると RunMicrovm がこの Promise の解決まで待つ */
     runGate: null,
+    runError: null,
+    tokenError: null,
+    deleteImageError: null,
+    stateGate: null,
+    vmState: "RUNNING",
+    endpointFor: (id) => `https://${id}.microvm.example`,
+    count(kind) {
+      return aws.calls.filter(([k]) => k === kind).length;
+    },
     async runMicroVm(params) {
-      aws.calls.push(["run", params.imageIdentifier]);
+      aws.calls.push(["run", params.imageIdentifier, params.clientToken]);
       const id = `mvm-${++seq}`;
       if (aws.runGate) await aws.runGate;
-      return { microvmId: id, endpointUrl: `https://${id}.microvm.example`, state: "RUNNING" };
+      if (aws.runError) throw aws.runError;
+      return { microvmId: id, endpointUrl: aws.endpointFor(id), state: "RUNNING" };
     },
     async createMicroVmAuthToken({ microvmId }) {
       aws.calls.push(["token", microvmId]);
       await Promise.resolve();
-      return { token: `jwe-${microvmId}`, expirationInMinutes: 15 };
+      if (aws.tokenError) throw aws.tokenError;
+      return { token: `jwe-${microvmId}-${aws.count("token")}`, expirationInMinutes: 15 };
     },
-    async getMicroVmState() {
-      return "RUNNING";
+    async getMicroVmState(id) {
+      aws.calls.push(["getState", id]);
+      if (aws.stateGate) await aws.stateGate;
+      return aws.vmState;
     },
     async terminateMicroVm(id) {
       aws.calls.push(["terminate", id]);
@@ -100,6 +102,7 @@ function createFakeAws() {
     },
     async deleteMicroVmImage(id) {
       aws.calls.push(["deleteImage", id]);
+      if (aws.deleteImageError) throw aws.deleteImageError;
     },
   };
   return aws;
@@ -114,28 +117,77 @@ function setup() {
   return { ctx, aws, dObj };
 }
 
+// MicroVM エンドポイント（アプリ）のフェイク。テストごとに upstreamHandler を差し替える
 const upstream = [];
+let upstreamHandler = () => new Response("ok", { status: 200 });
 globalThis.fetch = async (req) => {
   upstream.push({ url: req.url, auth: req.headers.get("X-aws-proxy-auth") });
-  return new Response("ok", { status: 200 });
+  return upstreamHandler(req);
 };
+test.beforeEach(() => {
+  upstream.length = 0;
+  upstreamHandler = () => new Response("ok", { status: 200 });
+});
 
 const apiRequest = (path = "/") =>
   new Request(`https://pr-1.preview.example.com${path}`, { headers: { Accept: "application/json" } });
+const htmlRequest = (path = "/") =>
+  new Request(`https://pr-1.preview.example.com${path}`, {
+    headers: { Accept: "text/html", "Sec-Fetch-Mode": "navigate" },
+  });
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+
+// --- 基本動作 ---
 
 test("通常アクセスで MicroVM を起動し、JWE を付けて転送する", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
-  upstream.length = 0;
 
   const res = await dObj.fetch(apiRequest("/hello?a=1"));
   assert.equal(res.status, 200);
-  assert.deepEqual(upstream, [{ url: "https://mvm-1.microvm.example/hello?a=1", auth: "jwe-mvm-1" }]);
+  assert.deepEqual(upstream, [{ url: "https://mvm-1.microvm.example/hello?a=1", auth: "jwe-mvm-1-1" }]);
   assert.equal(ctx.data.get("state").microvmId, "mvm-1");
-  assert.deepEqual(aws.calls, [["run", "img-v1"], ["token", "mvm-1"]]);
+  assert.equal(aws.count("run"), 1);
+  assert.equal(aws.count("token"), 1);
 });
+
+test("RunMicrovm には起動ごとに冪等トークン (clientToken) を付ける", async () => {
+  const { aws, dObj } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+  const [, , clientToken] = aws.calls.find(([k]) => k === "run");
+  assert.match(clientToken, /^[0-9a-f-]{36}$/);
+});
+
+test("endpoint がスキームなしのホスト名でも https で転送する", async () => {
+  assert.equal(normalizeEndpointUrl("abc.lambda-microvm.us-east-1.on.aws"), "https://abc.lambda-microvm.us-east-1.on.aws");
+  assert.equal(normalizeEndpointUrl("https://abc.example/"), "https://abc.example/");
+
+  const { aws, dObj } = setup();
+  aws.endpointFor = (id) => `${id}.lambda-microvm.ap-northeast-1.on.aws`;
+  await dObj.registerImage("img-v1");
+  const res = await dObj.fetch(apiRequest("/x"));
+  assert.equal(res.status, 200);
+  assert.equal(upstream[0].url, "https://mvm-1.lambda-microvm.ap-northeast-1.on.aws/x");
+});
+
+test("7時間45分を超えた MicroVM は終了して新しい MicroVM に切り替える", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+  const state = ctx.data.get("state");
+  state.createdAt = Date.now() - MAX_VM_LIFETIME_MS - 60_000;
+  ctx.data.set("state", state);
+
+  const res = await dObj.fetch(apiRequest("/"));
+  assert.equal(res.status, 200);
+  assert.ok(aws.terminated.includes("mvm-1"));
+  assert.equal(ctx.data.get("state").microvmId, "mvm-2");
+  assert.equal(upstream.at(-1).url, "https://mvm-2.microvm.example/");
+});
+
+// --- 同時実行・競合 ---
 
 test("同時アクセスでも RunMicrovm と JWE 発行はそれぞれ 1 回だけ", async () => {
   const { aws, dObj } = setup();
@@ -149,8 +201,8 @@ test("同時アクセスでも RunMicrovm と JWE 発行はそれぞれ 1 回だ
   const results = await Promise.all(pending);
 
   assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200, 200]);
-  assert.equal(aws.calls.filter(([k]) => k === "run").length, 1);
-  assert.equal(aws.calls.filter(([k]) => k === "token").length, 1);
+  assert.equal(aws.count("run"), 1);
+  assert.equal(aws.count("token"), 1);
 });
 
 test("起動中に新イメージが登録されたら、旧起動結果を捨てて新イメージで起動し直す", async () => {
@@ -161,18 +213,17 @@ test("起動中に新イメージが登録されたら、旧起動結果を捨�
 
   const pending = dObj.fetch(apiRequest("/"));
   await tick();
-  assert.deepEqual(aws.calls, [["run", "img-v1"]]);
+  assert.equal(aws.count("run"), 1);
 
   await dObj.registerImage("img-v2");
   gate.resolve();
   const res = await pending;
-  await Promise.all(ctx.waits);
+  await ctx.settle();
 
   assert.equal(res.status, 200);
   const state = ctx.data.get("state");
   assert.equal(state.imageIdentifier, "img-v2");
   assert.equal(state.microvmId, "mvm-2");
-  // 旧イメージで起動した VM は終了されている
   assert.ok(aws.terminated.includes("mvm-1"));
   assert.ok(!aws.terminated.includes("mvm-2"));
 });
@@ -183,17 +234,13 @@ test("コールドスタート中に新イメージが登録されても、バ�
   const gate = deferred();
   aws.runGate = gate.promise;
 
-  const htmlReq = new Request("https://pr-1.preview.example.com/", {
-    headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" },
-  });
-  const res = await dObj.fetch(htmlReq);
+  const res = await dObj.fetch(htmlRequest("/"));
   assert.equal(res.status, 503);
   await tick();
 
   await dObj.registerImage("img-v2");
   gate.resolve();
-  await Promise.all(ctx.waits);
-  await Promise.all(ctx.waits);
+  await ctx.settle();
 
   const state = ctx.data.get("state");
   assert.equal(state.imageIdentifier, "img-v2");
@@ -213,10 +260,169 @@ test("起動中に destroy されたら、環境を復活させず起動した V
   await dObj.destroy();
   gate.resolve();
   const res = await pending;
-  await Promise.all(ctx.waits);
+  await ctx.settle();
 
   assert.equal(res.status, 404);
   assert.equal(ctx.data.size, 0, "ストレージは空のまま");
   assert.deepEqual(await dObj.getStatus(), { registered: false, booting: false });
   assert.ok(aws.terminated.includes("mvm-1"));
+});
+
+test("自己修復が同時に走っても MicroVM は 1 台だけ起動し、記録を取り違えない", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/warm"));
+
+  // AWS 側で mvm-1 が終了済み: アプリへの転送は 410、GetMicrovm は TERMINATED
+  upstreamHandler = (req) =>
+    new Response(req.url.includes("mvm-1") ? "gone" : "ok", { status: req.url.includes("mvm-1") ? 410 : 200 });
+  aws.vmState = "TERMINATED";
+  const gate = deferred();
+  aws.stateGate = gate.promise;
+
+  const pending = Array.from({ length: 5 }, (_, i) => dObj.fetch(apiRequest(`/p${i}`)));
+  await tick();
+  gate.resolve();
+  const results = await Promise.all(pending);
+
+  assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200, 200]);
+  assert.equal(aws.count("run"), 2, "初回起動 + 自己修復の 1 回だけ");
+  assert.equal(aws.count("getState"), 1);
+  assert.equal(ctx.data.get("state").microvmId, "mvm-2");
+});
+
+// --- AWS / アプリのエラー ---
+
+test("RunMicrovm 失敗時は AWS のエラー内容を返さず 502、待機時間内は再起動しない", async () => {
+  const { aws, dObj } = setup();
+  await dObj.registerImage("img-v1");
+  aws.runError = new Error("RunMicrovm failed (402): ServiceQuotaExceededException secret-detail");
+
+  const res = await dObj.fetch(apiRequest("/"));
+  assert.equal(res.status, 502);
+  assert.doesNotMatch(await res.text(), /secret-detail|ServiceQuota/);
+
+  // ブラウザのリロードを繰り返しても「起動中」を出し続けず、RunMicrovm も呼ばない
+  for (let i = 0; i < 3; i++) {
+    const html = await dObj.fetch(htmlRequest("/"));
+    assert.equal(html.status, 502);
+    assert.match(await html.text(), /起動に失敗しました/);
+  }
+  assert.equal(aws.count("run"), 1);
+  assert.ok(BOOT_FAILURE_BACKOFF_MS >= 10_000);
+});
+
+test("JWE 発行が失敗したら例外を投げずに 502 を返す", async () => {
+  const { aws, dObj } = setup();
+  await dObj.registerImage("img-v1");
+  aws.tokenError = new Error("CreateMicrovmAuthToken failed (500): internal");
+  const res = await dObj.fetch(apiRequest("/"));
+  assert.equal(res.status, 502);
+  assert.doesNotMatch(await res.text(), /internal/);
+});
+
+test("アプリ自身の 404 が続いても GetMicrovm を毎回呼ばない", async () => {
+  const { aws, dObj } = setup();
+  await dObj.registerImage("img-v1");
+  upstreamHandler = () => new Response("not found", { status: 404 });
+
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await dObj.fetch(apiRequest("/missing"))).status, 404);
+  }
+  assert.equal(aws.count("getState"), 1);
+  assert.equal(aws.count("run"), 1);
+});
+
+test("アプリ自身の 403 が続いても JWE を毎回再発行しない", async () => {
+  const { aws, dObj } = setup();
+  await dObj.registerImage("img-v1");
+  upstreamHandler = () => new Response("forbidden", { status: 403 });
+
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await dObj.fetch(apiRequest("/forbidden"))).status, 403);
+  }
+  assert.equal(aws.count("token"), 2, "初回発行 + 強制再発行 1 回");
+});
+
+test("トークン失効の 403 は再発行して 1 回リトライする", async () => {
+  const { dObj } = setup();
+  await dObj.registerImage("img-v1");
+  upstreamHandler = (req) =>
+    new Response("", { status: req.headers.get("X-aws-proxy-auth") === "jwe-mvm-1-1" ? 403 : 200 });
+  const res = await dObj.fetch(apiRequest("/"));
+  assert.equal(res.status, 200);
+  assert.deepEqual(upstream.map((u) => u.auth), ["jwe-mvm-1-1", "jwe-mvm-1-2"]);
+});
+
+// --- 破棄と Alarm ---
+
+test("destroy でイメージ削除に失敗したら例外を投げ、削除待ちとして Alarm で再試行する", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/"));
+  aws.deleteImageError = new Error("ThrottlingException");
+
+  await assert.rejects(dObj.destroy(), { name: "CleanupIncompleteError" });
+  const status = await dObj.getStatus();
+  assert.equal(status.registered, false);
+  assert.deepEqual(status.cleanupPending, { microvmIds: [], imageIdentifiers: ["img-v1"] });
+  assert.ok(ctx.alarm && ctx.alarm <= Date.now() + CLEANUP_RETRY_DELAY_MS);
+  // 削除待ちが残っていてもプレビューは復活しない
+  assert.equal((await dObj.fetch(apiRequest("/"))).status, 404);
+
+  aws.deleteImageError = null;
+  await dObj.alarm();
+  assert.equal(aws.count("deleteImage"), 2);
+  assert.equal(ctx.data.size, 0);
+  assert.equal(ctx.alarm, null);
+});
+
+test("削除待ちのイメージが再登録されたら削除対象から外す", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  aws.deleteImageError = new Error("ThrottlingException");
+  await assert.rejects(dObj.destroy());
+
+  await dObj.registerImage("img-v1");
+  assert.equal(ctx.data.get("pendingCleanup"), undefined);
+  assert.equal((await dObj.getStatus()).registered, true);
+});
+
+test("Alarm: 掃除期限を過ぎた環境は破棄し、期限前なら削除待ちの再試行だけ行う", async () => {
+  const { aws, dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+
+  // 期限前: 削除待ちだけ再試行し、登録は残す
+  ctx.data.set("pendingCleanup", { microvmIds: ["mvm-old"], imageIdentifiers: [], retryAt: Date.now() });
+  await dObj.alarm();
+  assert.ok(aws.terminated.includes("mvm-old"));
+  assert.equal((await dObj.getStatus()).registered, true);
+  assert.ok(ctx.alarm > Date.now() + 13 * 24 * 60 * 60 * 1000, "次の Alarm は掃除期限");
+
+  // 期限切れ: 破棄する
+  const state = ctx.data.get("state");
+  state.zombieAt = Date.now() - 1;
+  ctx.data.set("state", state);
+  await dObj.alarm();
+  assert.equal((await dObj.getStatus()).registered, false);
+  assert.ok(aws.calls.some(([k, id]) => k === "deleteImage" && id === "img-v1"));
+});
+
+test("zombieAt のない旧バージョンの状態は、Alarm 発火時に従来どおり破棄する", async () => {
+  const { dObj, ctx } = setup();
+  ctx.data.set("state", { imageIdentifier: "img-legacy", updatedAt: Date.now() });
+  await dObj.alarm();
+  assert.equal(ctx.data.size, 0);
+});
+
+// --- コールドスタート判定 ---
+
+test("Turbo / fetch など非ナビゲーションのリクエストにはローディング画面を返さない", () => {
+  const req = (headers) => new Request("https://pr-1.preview.example.com/", { headers });
+  assert.equal(acceptsHtmlBrowserRequest(req({ Accept: "text/html", "Sec-Fetch-Mode": "navigate" })), true);
+  assert.equal(acceptsHtmlBrowserRequest(req({ Accept: "text/html" })), true, "Sec-Fetch-Mode なしは従来どおり");
+  assert.equal(
+    acceptsHtmlBrowserRequest(req({ Accept: "text/vnd.turbo-stream.html, text/html", "Sec-Fetch-Mode": "cors" })),
+    false
+  );
 });

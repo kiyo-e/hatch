@@ -38,6 +38,8 @@ export interface PersistedVmState {
   imageVersion?: string;
   /** registerImage ごとに更新される世代 ID（起動中の再登録・破棄の検出に使用） */
   generation?: string;
+  /** この時刻を過ぎたら放置 PR とみなして Alarm で破棄する（epoch ms） */
+  zombieAt?: number;
   microvmId?: string;
   endpointUrl?: string;
   createdAt?: number; // epoch ms
@@ -48,6 +50,7 @@ export interface ActiveVmState {
   imageIdentifier: string;
   imageVersion?: string;
   generation?: string;
+  zombieAt?: number;
   microvmId: string;
   endpointUrl: string;
   createdAt: number;
@@ -58,6 +61,13 @@ export interface CachedJweToken {
   microvmId: string;
   token: string;
   expiresAt: number; // epoch ms
+}
+
+/** destroy で終了・削除に失敗し、Alarm で再試行する対象 */
+export interface PendingCleanup {
+  microvmIds: string[];
+  imageIdentifiers: string[];
+  retryAt: number; // epoch ms
 }
 
 export interface RegisterImagePayload {
@@ -76,4 +86,9 @@ export interface PreviewStatusResponse {
   createdAt?: string;
   expiresAt?: string;
   alarmAt?: string;
+  /** destroy で削除しきれず、Alarm で再試行待ちのリソース */
+  cleanupPending?: {
+    microvmIds: string[];
+    imageIdentifiers: string[];
+  };
 }
