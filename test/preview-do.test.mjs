@@ -625,6 +625,18 @@ test("Alarm: 掃除期限はキューの中で判定し、先に並んだ登録�
   assert.equal((await dObj.getStatus()).imageIdentifier, "img-new");
 });
 
+test("登録時の旧 VM 終了では、ほかの削除待ちの再試行時刻を延ばさない", async () => {
+  const { dObj, ctx } = setup();
+  await dObj.registerImage("img-v1");
+  await dObj.fetch(apiRequest("/")); // mvm-1 起動
+  const retryAt = Date.now() + 1000;
+  ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-z"], retryAt });
+
+  await dObj.registerImage("img-v2"); // mvm-1 だけを終了する部分クリーンアップ
+  assert.equal(ctx.data.get("pendingCleanup").retryAt, retryAt);
+  assert.equal(ctx.alarm, retryAt);
+});
+
 test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");

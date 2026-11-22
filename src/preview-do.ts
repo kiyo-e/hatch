@@ -783,7 +783,12 @@ export class PreviewEnvironmentDO extends DurableObject<Env> {
       }
     }
 
-    await this.removeFromPendingCleanup(done, Date.now() + CLEANUP_RETRY_DELAY_MS);
+    // 一部の対象だけを処理した場合（登録時の旧 VM 終了など）は、試していない対象の再試行時刻を延ばさない
+    const nextRetryAt = Date.now() + CLEANUP_RETRY_DELAY_MS;
+    await this.removeFromPendingCleanup(
+      done,
+      only && pending ? Math.min(pending.retryAt, nextRetryAt) : nextRetryAt
+    );
     await this.scheduleNextAlarm();
     return (await this.ctx.storage.get<PendingCleanup>(STORAGE_KEY_PENDING_CLEANUP)) ?? null;
   }
