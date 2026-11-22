@@ -1,6 +1,6 @@
 # Preview Orchestrator (Cloudflare Workers + Durable Objects × AWS Lambda MicroVMs)
 
-Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://developers.cloudflare.com/durable-objects/get-started/) を使い、[AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html) の起動・8時間寿命管理・JWE 認証トークン発行・HTTP/WebSocket 透過プロキシを隠蔽する PR プレビュー環境オーケストレーターです。
+[Hono](https://hono.dev/) で書いた Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://developers.cloudflare.com/durable-objects/get-started/) を使い、[AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html) の起動・8時間寿命管理・JWE 認証トークン発行・HTTP/WebSocket 透過プロキシを隠蔽する PR プレビュー環境オーケストレーターです。
 
 ## 主な機能
 
@@ -9,6 +9,7 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 - **自己修復リトライ**: 寿命内でも AWS 側で `TERMINATED` / `NOT_FOUND` になっていた場合は `GetMicrovm` で状態確認のうえ 1 回だけ再起動リトライします。トークン失効（403）時は JWE トークンを再発行してリトライします。
 - **HTTP / WebSocket 透過プロキシ**: `X-aws-proxy-auth`（JWE）と `X-aws-proxy-port` を自動付与し、ActionCable 等の `Upgrade: websocket` リクエストも同じコードパスで転送します。
 - **コールドスタート UX 改善**: `COLD_START_LOADING_PAGE=true` の場合、起動中のブラウザリクエスト（`Accept: text/html`）には 3 秒自動リロードの軽量 HTML（HTTP 503 + `Retry-After: 3`）を即返し、バックグラウンドで起動を完了させます。
+- **管理画面**: `API_HOSTNAME` の `/admin` で、環境の一覧・状態・削除待ちを確認し、ブラウザから破棄できます（Cloudflare Access で保護）。
 - **DO Alarm によるゾンビイメージ掃除**: `registerImage` 時に `ZOMBIE_TTL_DAYS`（既定 14 日）後の Alarm を設定し、PR クローズ Webhook が取りこぼされても `destroy()` で自動削除します。`destroy` で MicroVM の終了やイメージの削除に失敗した分は削除待ちとして記録し、10 分後の Alarm で再試行します。
 
 ## 公式 API 仕様への準拠ポイント
@@ -29,7 +30,9 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 ```text
 .
 ├── src/
-│   ├── index.ts          # エッジルーター（CI 管理 API / プレビューサブドメイン転送）
+│   ├── index.ts          # Hono のエッジルーター（CI 管理 API / 管理画面 / プレビューサブドメイン転送）
+│   ├── admin.ts          # 管理画面（一覧・詳細・破棄）
+│   ├── registry-do.ts    # Durable Object（管理画面の一覧用に、登録された環境を記録する台帳）
 │   ├── preview-do.ts     # Durable Object（寿命管理・多重起動ロック・JWE キャッシュ・プロキシ・Alarm）
 │   ├── aws-microvm.ts    # AWS Lambda MicroVMs SigV4 クライアント (aws4fetch)
 │   ├── auth.ts           # CI Webhook 定数時間シークレット検証 & Cloudflare Access JWT 検証
@@ -41,6 +44,7 @@ Cloudflare Workers と SQLite バックエンドの [Durable Objects](https://de
 │   ├── auth.test.mjs                  # Cloudflare Access JWT 検証
 │   ├── aws-microvm.test.mjs           # AWS クライアントの認証情報
 │   ├── router.test.mjs                # 管理 API の入力検証
+│   ├── admin.test.mjs                 # 管理画面・台帳
 │   └── preview-orchestrator.test.mjs  # 設定・ソースの契約
 ├── examples/github-actions/   # アプリ側リポジトリに置く CI の例（このリポジトリでは実行されない）
 │   ├── preview-deploy.yml   # PR 更新時のイメージ登録例
@@ -86,6 +90,9 @@ npx wrangler secret put CI_WEBHOOK_SECRET
 # 任意: Cloudflare Access JWT 検証を有効化する場合（2 つとも設定してください。片方だけの場合はプレビューへのアクセスを 500 で拒否します）
 npx wrangler secret put CF_ACCESS_TEAM_DOMAIN
 npx wrangler secret put CF_ACCESS_AUD
+
+# 管理画面を使う場合: 管理画面用の Access アプリの AUD（CF_ACCESS_TEAM_DOMAIN も必要）
+npx wrangler secret put CF_ACCESS_ADMIN_AUD
 ```
 
 ### 4. デプロイ
@@ -132,6 +139,22 @@ Worker に渡す IAM ユーザーには以下のアクションを許可して�
   - 終了・削除に失敗したリソースがある場合は `502`（`{"ok": false, ...}`）を返し、Alarm で自動再試行する
 
 `:envId` はプレビューのサブドメインとして有効な DNS ラベル（英小文字・数字・ハイフン、先頭と末尾は英数字、63 文字以内）に限ります。
+
+## 管理画面
+
+`https://<API_HOSTNAME>/admin` で次の操作ができます。
+
+- 環境の一覧（状態・イメージ・MicroVM の期限・削除待ちの件数・プレビューを開くリンク）
+- 環境ごとの詳細（MicroVM ID・次の Alarm・削除待ちのリソース）
+- 破棄（MicroVM の終了とイメージの削除。削除しきれなかった分は Alarm で自動再試行）
+
+一覧は、管理 API の `register` / `destroy` で更新される台帳（`EnvRegistryDO`）から作ります。台帳を追加する前に登録した環境は、もう一度 `register` すると一覧に載ります。Alarm で自動破棄された環境は、一覧を開いたときに台帳から外れます。
+
+### 認証
+
+管理画面は CI シークレットでは開けません。Cloudflare Zero Trust で `<API_HOSTNAME>/admin` を対象にした Access アプリを作り、その AUD を `CF_ACCESS_ADMIN_AUD` に設定してください（`CF_ACCESS_TEAM_DOMAIN` はプレビューと共通）。CI が使う `/api/*` は Access の対象に含めないでください。
+
+`CF_ACCESS_ADMIN_AUD` が無い場合、管理画面は 503 を返します（fail closed）。ただし `localhost` / `*.localhost` へのアクセスだけは、`wrangler dev` で試せるよう認証なしで開けます。
 
 ## アプリ側の CI 例（GitHub Actions）
 

@@ -204,3 +204,29 @@ function extractCookie(cookieHeader: string | null, name: string): string | null
   }
   return null;
 }
+
+/**
+ * 管理画面（API_HOSTNAME の /admin）へのアクセスを検証する。
+ * - CF_ACCESS_TEAM_DOMAIN と CF_ACCESS_ADMIN_AUD があれば、管理画面用 Access アプリの JWT を検証する
+ * - 未設定なら fail closed（503）。ただし localhost / *.localhost（wrangler dev）だけは素通しする
+ */
+export async function verifyAdminAccess(
+  request: Request,
+  env: Pick<Env, "CF_ACCESS_TEAM_DOMAIN" | "CF_ACCESS_ADMIN_AUD">
+): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
+  if (env.CF_ACCESS_TEAM_DOMAIN && env.CF_ACCESS_ADMIN_AUD) {
+    return verifyPreviewAccess(request, {
+      CF_ACCESS_TEAM_DOMAIN: env.CF_ACCESS_TEAM_DOMAIN,
+      CF_ACCESS_AUD: env.CF_ACCESS_ADMIN_AUD,
+    });
+  }
+  const hostname = new URL(request.url).hostname.toLowerCase();
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    status: 503,
+    message: "Admin UI is disabled. Set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_ADMIN_AUD to enable it.",
+  };
+}

@@ -20,9 +20,12 @@ test("wrangler.jsonc は SQLite Durable Object マイグレーションと必須
   assert.ok(config.compatibility_flags.includes("nodejs_compat"));
   assert.deepEqual(config.durable_objects.bindings, [
     { name: "PREVIEW_DO", class_name: "PreviewEnvironmentDO" },
+    { name: "ENV_REGISTRY", class_name: "EnvRegistryDO" },
   ]);
+  // 既存のマイグレーションは書き換えず、新しいクラスは新しいタグで追加する
   assert.deepEqual(config.migrations, [
     { tag: "v1", new_sqlite_classes: ["PreviewEnvironmentDO"] },
+    { tag: "v2", new_sqlite_classes: ["EnvRegistryDO"] },
   ]);
   assert.equal(config.vars.AWS_REGION, "ap-northeast-1");
   assert.equal(config.vars.APP_TARGET_PORT, "8080");

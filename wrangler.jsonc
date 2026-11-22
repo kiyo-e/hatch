@@ -9,6 +9,10 @@
       {
         "name": "PREVIEW_DO",
         "class_name": "PreviewEnvironmentDO"
+      },
+      {
+        "name": "ENV_REGISTRY",
+        "class_name": "EnvRegistryDO"
       }
     ]
   },
@@ -16,6 +20,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["PreviewEnvironmentDO"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["EnvRegistryDO"]
     }
   ],
   "vars": {
@@ -33,4 +41,5 @@
   // - CI_WEBHOOK_SECRET
   // - CF_ACCESS_TEAM_DOMAIN (任意: Cloudflare Access 検証を有効化する場合)
   // - CF_ACCESS_AUD         (任意: Cloudflare Access 検証を有効化する場合)
+  // - CF_ACCESS_ADMIN_AUD   (管理画面 /admin を使う場合。管理画面用 Access アプリの AUD)
 }

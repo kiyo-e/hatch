@@ -32,6 +32,10 @@ function createEnv(stubOverrides = {}) {
       API_HOSTNAME: "api.preview.example.com",
       PREVIEW_BASE_DOMAIN: "preview.example.com",
       PREVIEW_DO: { idFromName: (name) => name, get: () => stub },
+      ENV_REGISTRY: {
+        idFromName: (name) => name,
+        get: () => ({ async upsert() {}, async remove() {}, async list() { return []; } }),
+      },
     },
   };
 }
