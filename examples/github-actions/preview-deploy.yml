@@ -1,38 +1,38 @@
-# PR の作成・更新のたびに、プレビュー環境を作り直す（アプリ側のリポジトリに置く例）。
+# Rebuilds and updates the preview environment on every PR open/update (example for application repositories).
 #
-#   1. アプリのコンテナイメージを arm64 でビルドし、ECR にブランチ名のタグで push する（同じタグを上書き）
-#   2. そのイメージで、外部 DB に PR 用のデータベースを作り、スキーマと seed を流す（何度実行しても同じ結果になること）
-#   3. MicroVM イメージを PR ごとに 1 つの名前で作る / 更新する（新しいバージョンが足される）
-#   4. hatch に登録する（同じ ARN の再登録で、古い MicroVM を止めて最新のバージョンで起動し直す）
-#   5. MicroVM イメージの古いバージョンを消す
+#   1. Build the arm64 container image and push to ECR with a branch-based tag
+#   2. Create and seed the PR database using that image (must be idempotent)
+#   3. Create or update the per-PR MicroVM image (adds a new image version)
+#   4. Register the ARN with hatch (terminates old MicroVMs and boots the latest version on next request)
+#   5. Prune old MicroVM image versions
 #
-# 必要な設定（README の「アプリ側の CI 例」を参照）:
+# Required configuration (see README "CI Integration"):
 #   vars:    AWS_REGION, PREVIEW_CI_ROLE_ARN, PREVIEW_ECR_REPOSITORY, PREVIEW_ARTIFACT_BUCKET,
 #            PREVIEW_BUILD_ROLE_ARN, HATCH_API_BASE_URL, PREVIEW_BASE_DOMAIN,
-#            PREVIEW_DB_SETUP_COMMAND（任意。既定 bin/rails db:prepare）, PREVIEW_EGRESS_CONNECTOR（任意）
-#   secrets: CI_WEBHOOK_SECRET, PREVIEW_DATABASE_URL_BASE（例: postgres://user:pass@db.example.internal:5432）
-#   files:   examples/github-actions/scripts/*.sh を .github/hatch/ にコピーする
+#            PREVIEW_DB_SETUP_COMMAND (optional, default: bin/rails db:prepare), PREVIEW_EGRESS_CONNECTOR (optional)
+#   secrets: CI_WEBHOOK_SECRET, PREVIEW_DATABASE_URL_BASE (e.g. postgres://user:pass@db.example.internal:5432)
+#   files:   Copy examples/github-actions/scripts/*.sh to .github/hatch/
 name: Deploy PR Preview
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# 同じ PR のデプロイと片付けは順番に実行する（ビルド中のイメージを途中で止めない）
+# Serialize deploy and cleanup for the same PR
 concurrency:
   group: preview-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 permissions:
-  id-token: write # AWS への OIDC 認証
+  id-token: write # AWS OIDC authentication
   contents: read
-  pull-requests: write # PR へのコメント
+  pull-requests: write # PR preview URL comment
 
 jobs:
   deploy:
-    # フォークからの PR にはシークレットが渡らないため実行しない
+    # Skip PRs from forks since secrets are not available
     if: github.event.pull_request.head.repo.full_name == github.repository
-    # MicroVM は arm64 なので、arm64 のランナーでそのままビルドする
+    # MicroVMs require arm64
     runs-on: ubuntu-24.04-arm
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
@@ -56,12 +56,11 @@ jobs:
         env:
           REPOSITORY: ${{ steps.ecr.outputs.registry }}/${{ vars.PREVIEW_ECR_REPOSITORY }}
         run: |
-          # タグは pr-<番号>-<ブランチ名>。ECR のタグに使えない文字（/ や日本語など）を - にし、
-          # 先頭は英数字にする（ブランチ名が記号や日本語で始まってもタグとして有効にするため）。
-          # 同じブランチは同じタグを上書きし、古いイメージはタグなしになって ECR のライフサイクルで消える
+          # Tag format: pr-<number>-<branch>. Replace characters invalid in ECR tags with '-'.
+          # Overwriting the branch tag lets the ECR lifecycle policy expire older untagged images.
           tag="$(printf '%s-%s' "$ENV_ID" "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
-          # --load で DB のセットアップ用に手元にも残し、push した digest は metadata から取る
-          # （docker inspect の RepoDigests は、ビルダーによってはタグの付いていない子マニフェストを指す）
+          # Keep the image locally (--load) for DB setup, and read the pushed digest from metadata-file
+          # (docker inspect RepoDigests can point to an untagged child manifest depending on the builder).
           docker buildx build --platform linux/arm64 --provenance=false \
             -t "${REPOSITORY}:${tag}" --push --load --metadata-file "$RUNNER_TEMP/image-meta.json" .
           digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image-meta.json")"
@@ -74,7 +73,7 @@ jobs:
           SETUP_COMMAND: ${{ vars.PREVIEW_DB_SETUP_COMMAND || 'bin/rails db:prepare' }}
           APP_IMAGE: ${{ steps.image.outputs.local }}
         run: |
-          # ランナーから DB に届く必要がある（届かない場合は、VPC 内のセルフホストランナーや ECS の one-off タスクで実行する）
+          # The runner must be able to reach the database (use a self-hosted runner or ECS task if inside a VPC).
           # shellcheck disable=SC2086
           docker run --rm \
             -e DATABASE_URL="${DATABASE_URL_BASE}/${DB_NAME}" \
@@ -90,7 +89,7 @@ jobs:
           EGRESS_CONNECTOR: ${{ vars.PREVIEW_EGRESS_CONNECTOR }}
           DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
         run: |
-          # イメージに渡す環境変数（イメージの設定として保存されるため、閲覧できる人を IAM で絞ること）
+          # Passed as MicroVM image env vars (visible to IAM principals who can describe the image).
           ENVIRONMENT_JSON="$(jq -cn --arg url "${DATABASE_URL_BASE}/${DB_NAME}" '{DATABASE_URL: $url}')"
           export ENVIRONMENT_JSON
           .github/hatch/build-microvm-image.sh
@@ -120,9 +119,8 @@ jobs:
         run: |
           marker='<!-- hatch-preview -->'
           body="${marker}
-          プレビュー: ${URL}（イメージ ${IMAGE_NAME} ${VERSION} / ${GITHUB_SHA::7}）"
-          # 2 回目以降は、目印の付いたこのワークフローのコメントだけを書き換える
-          # （--edit-last は github-actions[bot] の最後のコメントなので、ほかのワークフローのコメントを上書きしうる）
+          Preview: ${URL} (image ${IMAGE_NAME} ${VERSION} / ${GITHUB_SHA::7})"
+          # Update only the comment created by this workflow on subsequent runs.
           comment_id="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
             --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" | tail -n 1)"
           if [ -n "$comment_id" ]; then

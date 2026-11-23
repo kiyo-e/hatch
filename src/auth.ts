@@ -1,7 +1,7 @@
 import type { Env } from "./types";
 
 /**
- * タイミング攻撃を防ぐための定数時間文字列比較。
+ * Constant-time string comparison to prevent timing attacks.
  */
 export function timingSafeEqual(a: string, b: string): boolean {
   const encoder = new TextEncoder();
@@ -17,7 +17,7 @@ export function timingSafeEqual(a: string, b: string): boolean {
 }
 
 /**
- * CI Webhook からの X-CI-Secret ヘッダーを検証する。
+ * Verify the X-CI-Secret header from CI webhooks.
  */
 export function verifyCiSecret(request: Request, env: Pick<Env, "CI_WEBHOOK_SECRET">): boolean {
   const provided = request.headers.get("X-CI-Secret");
@@ -48,7 +48,7 @@ function base64UrlDecode(input: string): Uint8Array {
   return bytes;
 }
 
-// 未知の kid による JWKS 強制再取得の最短間隔（ランダムな kid で JWKS 取得を連打させないため）
+// Minimum interval between forced JWKS refreshes on unknown kids to prevent cache-busting floods.
 const JWKS_FORCE_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
 let lastForcedJwksRefreshAt = 0;
 let forcedJwksRefresh: Promise<JwkKey[]> | null = null;
@@ -74,8 +74,7 @@ async function fetchAccessJwks(teamDomain: string, forceRefresh = false): Promis
 }
 
 /**
- * kid に一致する鍵を探す。見つからなければ鍵ローテーションの可能性があるため、
- * 一定間隔に 1 回まで JWKS を再取得して探し直す。
+ * Look up a JWK by kid, forcing a rate-limited JWKS refresh once if not found (handles key rotation).
  */
 async function findAccessJwk(teamDomain: string, kid: string | undefined): Promise<JwkKey | undefined> {
   if (!kid) return undefined;
@@ -83,7 +82,6 @@ async function findAccessJwk(teamDomain: string, kid: string | undefined): Promi
   const hit = cached.find((k) => k.kid === kid);
   if (hit) return hit;
 
-  // 同時に届いたリクエストは実行中の再取得に相乗りする（間隔制限は新たな再取得にのみ適用）
   if (!forcedJwksRefresh) {
     const now = Date.now();
     if (now - lastForcedJwksRefreshAt < JWKS_FORCE_REFRESH_MIN_INTERVAL_MS) {
@@ -93,7 +91,6 @@ async function findAccessJwk(teamDomain: string, kid: string | undefined): Promi
     lastForcedJwksRefreshAt = now;
     const refresh: Promise<JwkKey[]> = fetchAccessJwks(teamDomain, true)
       .catch((err: unknown) => {
-        // 取得に失敗したら間隔制限を戻し、次のリクエストで再取得できるようにする
         if (lastForcedJwksRefreshAt === now) lastForcedJwksRefreshAt = previousRefreshAt;
         throw err;
       })
@@ -107,10 +104,8 @@ async function findAccessJwk(teamDomain: string, kid: string | undefined): Promi
 }
 
 /**
- * Cloudflare Access JWT (CF-Access-Jwt-Assertion) の検証。
- * CF_ACCESS_TEAM_DOMAIN と CF_ACCESS_AUD が両方設定されている場合に強制する。
- * 両方未設定の場合はパススルー（別途 Cloudflare Access / GitHub OAuth 等で保護する前提）。
- * 片方だけ設定されている場合は設定ミスとして 500 を返す。
+ * Verify Cloudflare Access JWT (CF-Access-Jwt-Assertion) when both CF_ACCESS_TEAM_DOMAIN
+ * and CF_ACCESS_AUD are set. Passes through if neither is set; fails closed (500) if only one is set.
  */
 export async function verifyPreviewAccess(
   request: Request,
@@ -119,7 +114,6 @@ export async function verifyPreviewAccess(
   if (!env.CF_ACCESS_TEAM_DOMAIN && !env.CF_ACCESS_AUD) {
     return { ok: true };
   }
-  // 片方だけ設定されている場合は設定ミスとみなし、認証なしで素通しさせない（fail closed）
   if (!env.CF_ACCESS_TEAM_DOMAIN || !env.CF_ACCESS_AUD) {
     console.error("[auth] Both CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set to enable Cloudflare Access verification");
     return { ok: false, status: 500, message: "Cloudflare Access verification is misconfigured" };
@@ -161,7 +155,7 @@ export async function verifyPreviewAccess(
     if (payload.nbf && payload.nbf > nowSec + 60) {
       return { ok: false, status: 401, message: "Access token not yet valid" };
     }
-    // aud は配列または文字列（JWT 仕様）。文字列の部分一致にならないよう配列に揃えて完全一致で比較する
+    // aud can be a string or string[] per JWT spec; normalize to array for exact matching.
     const audiences = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
     if (!audiences.includes(env.CF_ACCESS_AUD)) {
       return { ok: false, status: 403, message: "Invalid Access audience" };
@@ -206,9 +200,8 @@ function extractCookie(cookieHeader: string | null, name: string): string | null
 }
 
 /**
- * 管理画面（API_HOSTNAME の /admin）へのアクセスを検証する。
- * - CF_ACCESS_TEAM_DOMAIN と CF_ACCESS_ADMIN_AUD があれば、管理画面用 Access アプリの JWT を検証する
- * - 未設定なら fail closed（503）。ただし localhost / *.localhost（wrangler dev）だけは素通しする
+ * Verify access to Admin UI (/admin on API_HOSTNAME).
+ * Fails closed (503) when unconfigured, except on localhost / *.localhost for local dev.
  */
 export async function verifyAdminAccess(
   request: Request,

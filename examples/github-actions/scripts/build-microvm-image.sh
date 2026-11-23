@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# PR ごとの MicroVM イメージを作る（2 回目以降は同じ名前のまま新しいバージョンを足す）。
+# Build or update a per-PR MicroVM image (subsequent runs add a new version under the same image name).
 #
-# 必須の環境変数:
-#   AWS_REGION          例: ap-northeast-1
-#   IMAGE_NAME          MicroVM イメージ名（PR ごとに 1 つ）。例: preview-pr-123
-#   CONTAINER_IMAGE     ベースにするコンテナイメージ（同じアカウントの ECR。digest で固定する）
-#                       例: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/app-preview@sha256:...
-#   ARTIFACT_BUCKET     コード成果物（Dockerfile の zip）を置く S3 バケット
-#   BUILD_ROLE_ARN      イメージのビルドで使う IAM ロール（S3 の読み取り・ECR の pull・ログ）
-# 任意:
-#   ENVIRONMENT_JSON    イメージに渡す環境変数の JSON（例: {"DATABASE_URL":"..."}）
-#   EGRESS_CONNECTOR    VPC 内の DB などへ出るための egress network connector の ARN
+# Required env vars:
+#   AWS_REGION          e.g. ap-northeast-1
+#   IMAGE_NAME          Per-PR MicroVM image name (e.g. preview-pr-123)
+#   CONTAINER_IMAGE     Base container image in the same account's ECR (pinned by digest)
+#                       e.g. 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/app-preview@sha256:...
+#   ARTIFACT_BUCKET     S3 bucket for the zipped Dockerfile artifact
+#   BUILD_ROLE_ARN      IAM role used by Lambda MicroVMs builder (S3 read, ECR pull, CloudWatch Logs)
+# Optional:
+#   ENVIRONMENT_JSON    JSON env vars for the image (e.g. {"DATABASE_URL":"..."})
+#   EGRESS_CONNECTOR    Egress network connector ARN for VPC database access
 #
-# 出力: GITHUB_OUTPUT に image_arn と image_version を書く（GitHub Actions 外では標準出力）
+# Outputs: writes image_arn and image_version to GITHUB_OUTPUT (or stdout outside GitHub Actions).
 set -euo pipefail
 
 : "${AWS_REGION:?}" "${IMAGE_NAME:?}" "${CONTAINER_IMAGE:?}" "${ARTIFACT_BUCKET:?}" "${BUILD_ROLE_ARN:?}"
@@ -21,10 +21,8 @@ IMAGE_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT}:microvm-image:${IMAGE_NAME}"
 BASE_IMAGE_ARN="arn:aws:lambda:${AWS_REGION}:aws:microvm-image:al2023-1"
 OUTPUT="${GITHUB_OUTPUT:-/dev/stdout}"
 
-# コード成果物: アプリのコンテナイメージをベースにする Dockerfile と、どのイメージから作ったかの目印のファイル
-# （CMD / ENTRYPOINT はアプリのイメージのものを使う。アプリは APP_TARGET_PORT で待ち受けること）
-# FROM だけで新しいレイヤーが無いと、OCI 形式で push したイメージ（buildx の既定）のビルドが
-# "An unknown error occurred." で失敗するため、目印のファイルを COPY して必ずレイヤーを 1 つ足す
+# Add a small metadata file via COPY so OCI images pushed by docker buildx always have a new layer
+# (a Dockerfile with only FROM can fail with "An unknown error occurred.").
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 printf 'image=%s\ncommit=%s\n' "$CONTAINER_IMAGE" "${GITHUB_SHA:-}" > "$WORK/hatch-image.txt"
@@ -43,7 +41,7 @@ args=(
 [ -n "${EGRESS_CONNECTOR:-}" ] && args+=(--egress-network-connectors "$EGRESS_CONNECTOR")
 
 if aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" >/dev/null 2>&1; then
-  # 更新は PUT と同じ扱いで、毎回すべての項目を渡す。新しいバージョンのビルドが始まる
+  # update-microvm-image replaces all fields (PUT semantics) and builds a new version.
   aws lambda-microvms update-microvm-image --image-identifier "$IMAGE_ARN" "${args[@]}" >/dev/null
   echo "updating ${IMAGE_NAME}"
 else
@@ -51,7 +49,7 @@ else
   echo "creating ${IMAGE_NAME}"
 fi
 
-# ビルド中のバージョンが無くなるまで待つ（最大 30 分）
+# Wait up to 30 minutes for the image build to finish.
 for _ in $(seq 1 120); do
   sleep 15
   versions="$(aws lambda-microvms list-microvm-image-versions --image-identifier "$IMAGE_ARN" \

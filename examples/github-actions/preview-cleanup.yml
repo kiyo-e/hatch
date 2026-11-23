@@ -1,8 +1,8 @@
-# PR を閉じたときに、プレビュー環境を片付ける（アプリ側のリポジトリに置く例）。
-#   1. hatch で破棄する（MicroVM の終了と MicroVM イメージの削除。消しきれなかった分は hatch が自動で再試行する）
-#   2. PR 用のデータベースを消す
-#   3. ECR のブランチのタグと、S3 のコード成果物を消す
-# 取りこぼし（このジョブの失敗、hatch の自動破棄、管理画面からの破棄）は preview-sweep.yml が拾う。
+# Cleans up the preview environment when a PR is closed (example for application repositories).
+#   1. Destroy the environment on hatch (terminates MicroVM and deletes MicroVM image; hatch retries failures)
+#   2. Drop the PR database
+#   3. Delete the ECR branch tag and S3 build artifacts
+# Missed cleanups (job failures, zombie TTL auto-destruction, or Admin UI destroys) are caught by preview-sweep.yml.
 name: Cleanup PR Preview
 
 on:
@@ -35,7 +35,7 @@ jobs:
 
       - name: Destroy the preview on hatch
         id: destroy
-        continue-on-error: true # 失敗しても DB などの片付けは続け、最後にジョブを失敗にする
+        continue-on-error: true # Continue DB/ECR/S3 cleanup even if hatch destroy fails
         env:
           CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
           API_BASE_URL: ${{ vars.HATCH_API_BASE_URL }}
@@ -45,12 +45,12 @@ jobs:
 
       - name: Drop the preview database
         id: drop
-        continue-on-error: true # 失敗しても ECR と S3 の片付けは続ける（DB は preview-sweep.yml でも消す）
+        continue-on-error: true # Continue ECR/S3 cleanup; preview-sweep.yml also cleans up DBs
         env:
           DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
         run: |
           sudo apt-get install -y -qq postgresql-client >/dev/null
-          # 残っている接続ごと消す（PostgreSQL 13 以降）
+          # Terminate active connections before dropping (PostgreSQL 13+)
           psql "${DATABASE_URL_BASE}/postgres" -v ON_ERROR_STOP=1 \
             -c "DROP DATABASE IF EXISTS \"${DB_NAME}\" WITH (FORCE)"
 
@@ -60,7 +60,7 @@ jobs:
           ARTIFACT_BUCKET: ${{ vars.PREVIEW_ARTIFACT_BUCKET }}
         run: |
           tag="$(printf '%s-%s' "$ENV_ID" "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
-          # 片方が失敗しても、もう片方は実行する（S3 は preview-sweep.yml でも拾わないため）
+          # Run both deletions even if one fails (S3 artifacts are not covered by preview-sweep.yml)
           failed=0
           aws ecr batch-delete-image --repository-name "$REPOSITORY" --image-ids "imageTag=${tag}" >/dev/null || failed=1
           aws s3 rm "s3://${ARTIFACT_BUCKET}/${IMAGE_NAME}/" --recursive >/dev/null || failed=1
@@ -72,5 +72,5 @@ jobs:
           DESTROY: ${{ steps.destroy.outcome }}
           DROP: ${{ steps.drop.outcome }}
         run: |
-          echo "::error::片付けが完了していません（hatch の破棄: ${DESTROY} / DB の削除: ${DROP}）。残りは hatch の再試行と preview-sweep.yml で片付けます"
+          echo "::error::Cleanup incomplete (hatch destroy: ${DESTROY} / DB drop: ${DROP}). Remaining resources will be retried by hatch and preview-sweep.yml."
           exit 1

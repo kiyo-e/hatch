@@ -2,11 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import "./helpers/register-ts-hooks.mjs";
 
-/**
- * src/preview-do.ts を Node.js の型ストリッピングで直接読み込み、
- * インメモリのストレージと AWS クライアントのフェイクで Durable Object の振る舞いを検証する。
- */
-
 const {
   PreviewEnvironmentDO,
   MAX_VM_LIFETIME_MS,
@@ -67,7 +62,6 @@ function createFakeAws() {
   const aws = {
     calls: [],
     terminated: [],
-    /** 設定すると RunMicrovm がこの Promise の解決まで待つ */
     runGate: null,
     runError: null,
     tokenError: null,
@@ -94,7 +88,6 @@ function createFakeAws() {
       if (aws.tokenError) throw aws.tokenError;
       return { token: `jwe-${microvmId}-${aws.count("token")}`, expirationInMinutes: 15 };
     },
-    /** 設定すると、終了済みの VM の状態をこの関数で返す（既定は即座に TERMINATED） */
     terminatedStateFor: null,
     async getMicroVmState(id) {
       aws.calls.push(["getState", id]);
@@ -126,7 +119,6 @@ function setup(options) {
   return { ctx, aws, dObj };
 }
 
-// MicroVM エンドポイント（アプリ）のフェイク。テストごとに upstreamHandler を差し替える
 const upstream = [];
 let upstreamHandler = () => new Response("ok", { status: 200 });
 globalThis.fetch = async (req) => {
@@ -147,9 +139,9 @@ const htmlRequest = (path = "/") =>
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
-// --- 基本動作 ---
+// --- Core Lifecycle ---
 
-test("通常アクセスで MicroVM を起動し、JWE を付けて転送する", async () => {
+test("boots MicroVM on request and proxies with JWE token", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
 
@@ -161,7 +153,7 @@ test("通常アクセスで MicroVM を起動し、JWE を付けて転送する"
   assert.equal(aws.count("token"), 1);
 });
 
-test("RunMicrovm には起動ごとに冪等トークン (clientToken) を付ける", async () => {
+test("passes a UUID clientToken on each RunMicrovm call", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/"));
@@ -169,7 +161,7 @@ test("RunMicrovm には起動ごとに冪等トークン (clientToken) を付け
   assert.match(clientToken, /^[0-9a-f-]{36}$/);
 });
 
-test("endpoint がスキームなしのホスト名でも https で転送する", async () => {
+test("normalizes scheme-less endpoint hostnames to https://", async () => {
   assert.equal(normalizeEndpointUrl("abc.lambda-microvm.us-east-1.on.aws"), "https://abc.lambda-microvm.us-east-1.on.aws");
   assert.equal(normalizeEndpointUrl("https://abc.example/"), "https://abc.example/");
 
@@ -181,7 +173,7 @@ test("endpoint がスキームなしのホスト名でも https で転送する"
   assert.equal(upstream[0].url, "https://mvm-1.lambda-microvm.ap-northeast-1.on.aws/x");
 });
 
-test("7時間45分を超えた MicroVM は終了して新しい MicroVM に切り替える", async () => {
+test("rotates MicroVM after exceeding 7h45m effective TTL", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/"));
@@ -196,9 +188,9 @@ test("7時間45分を超えた MicroVM は終了して新しい MicroVM に切�
   assert.equal(upstream.at(-1).url, "https://mvm-2.microvm.example/");
 });
 
-// --- 同時実行・競合 ---
+// --- Concurrency & Races ---
 
-test("同時アクセスでも RunMicrovm と JWE 発行はそれぞれ 1 回だけ", async () => {
+test("deduplicates concurrent RunMicrovm and JWE token requests", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -214,7 +206,7 @@ test("同時アクセスでも RunMicrovm と JWE 発行はそれぞれ 1 回だ
   assert.equal(aws.count("token"), 1);
 });
 
-test("起動中に新イメージが登録されたら、旧起動結果を捨てて新イメージで起動し直す", async () => {
+test("discards stale boot and re-provisions when a new image is registered mid-boot", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -237,7 +229,7 @@ test("起動中に新イメージが登録されたら、旧起動結果を捨�
   assert.ok(!aws.terminated.includes("mvm-2"));
 });
 
-test("コールドスタート中に新イメージが登録されても、バックグラウンド起動は新イメージになる", async () => {
+test("background cold-start boot switches to newly registered image", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -253,11 +245,11 @@ test("コールドスタート中に新イメージが登録されても、バ�
 
   const state = ctx.data.get("state");
   assert.equal(state.imageIdentifier, "img-v2");
-  assert.ok(state.microvmId, "新イメージの VM がバックグラウンドで起動している");
+  assert.ok(state.microvmId);
   assert.ok(aws.terminated.includes("mvm-1"));
 });
 
-test("起動中に destroy されたら、環境を復活させず起動した VM を終了する", async () => {
+test("terminates booted VM and keeps storage empty when destroyed mid-boot", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -272,17 +264,16 @@ test("起動中に destroy されたら、環境を復活させず起動した V
   await ctx.settle();
 
   assert.equal(res.status, 404);
-  assert.equal(ctx.data.size, 0, "ストレージは空のまま");
+  assert.equal(ctx.data.size, 0);
   assert.deepEqual(await dObj.getStatus(), { registered: false, booting: false });
   assert.ok(aws.terminated.includes("mvm-1"));
 });
 
-test("自己修復が同時に走っても MicroVM は 1 台だけ起動し、記録を取り違えない", async () => {
+test("self-healing under concurrent requests boots only one replacement MicroVM", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/warm"));
 
-  // AWS 側で mvm-1 が終了済み: アプリへの転送は 410、GetMicrovm は TERMINATED
   upstreamHandler = (req) =>
     new Response(req.url.includes("mvm-1") ? "gone" : "ok", { status: req.url.includes("mvm-1") ? 410 : 200 });
   aws.vmState = "TERMINATED";
@@ -295,14 +286,14 @@ test("自己修復が同時に走っても MicroVM は 1 台だけ起動し、�
   const results = await Promise.all(pending);
 
   assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200, 200]);
-  assert.equal(aws.count("run"), 2, "初回起動 + 自己修復の 1 回だけ");
+  assert.equal(aws.count("run"), 2);
   assert.equal(aws.count("getState"), 1);
   assert.equal(ctx.data.get("state").microvmId, "mvm-2");
 });
 
-// --- AWS / アプリのエラー ---
+// --- Error Handling ---
 
-test("RunMicrovm 失敗時は AWS のエラー内容を返さず 502、待機時間内は再起動しない", async () => {
+test("hides AWS error details with 502 on RunMicrovm failure and enforces boot backoff", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
   aws.runError = new Error("RunMicrovm failed (402): ServiceQuotaExceededException secret-detail");
@@ -311,17 +302,16 @@ test("RunMicrovm 失敗時は AWS のエラー内容を返さず 502、待機時
   assert.equal(res.status, 502);
   assert.doesNotMatch(await res.text(), /secret-detail|ServiceQuota/);
 
-  // ブラウザのリロードを繰り返しても「起動中」を出し続けず、RunMicrovm も呼ばない
   for (let i = 0; i < 3; i++) {
     const html = await dObj.fetch(htmlRequest("/"));
     assert.equal(html.status, 502);
-    assert.match(await html.text(), /起動に失敗しました/);
+    assert.match(await html.text(), /Failed to start preview environment/);
   }
   assert.equal(aws.count("run"), 1);
   assert.ok(BOOT_FAILURE_BACKOFF_MS >= 10_000);
 });
 
-test("コールドスタートの裏で起動に失敗したら、原因をログに残す", async (t) => {
+test("logs background cold-start boot failures", async (t) => {
   const { aws, dObj, ctx } = setup();
   const logged = t.mock.method(console, "error", () => {});
   await dObj.registerImage("img-v1");
@@ -332,13 +322,10 @@ test("コールドスタートの裏で起動に失敗したら、原因をロ�
   await ctx.settle();
 
   const messages = logged.mock.calls.map((c) => c.arguments.map(String).join(" "));
-  assert.ok(
-    messages.some((m) => m.includes("background boot failed") && m.includes("security token")),
-    `ログに起動失敗の原因が出ていない: ${messages.join(" | ")}`
-  );
+  assert.ok(messages.some((m) => m.includes("background boot failed") && m.includes("security token")));
 });
 
-test("コールドスタート中に破棄されても、起動の取りやめはエラーとしてログに残さない", async (t) => {
+test("does not log error when background cold-start is canceled by destroy", async (t) => {
   const { aws, dObj, ctx } = setup();
   const logged = t.mock.method(console, "error", () => {});
   await dObj.registerImage("img-v1");
@@ -351,13 +338,10 @@ test("コールドスタート中に破棄されても、起動の取りやめ�
   gate.resolve();
   await ctx.settle();
 
-  assert.ok(
-    !logged.mock.calls.some((c) => String(c.arguments[0]).includes("background boot failed")),
-    "再登録・破棄による起動の取りやめは失敗ではない"
-  );
+  assert.ok(!logged.mock.calls.some((c) => String(c.arguments[0]).includes("background boot failed")));
 });
 
-test("JWE 発行が失敗したら例外を投げずに 502 を返す", async () => {
+test("returns 502 without leaking details when JWE token issuance fails", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
   aws.tokenError = new Error("CreateMicrovmAuthToken failed (500): internal");
@@ -366,7 +350,7 @@ test("JWE 発行が失敗したら例外を投げずに 502 を返す", async ()
   assert.doesNotMatch(await res.text(), /internal/);
 });
 
-test("アプリ自身の 404 が続いても GetMicrovm を毎回呼ばない", async () => {
+test("rate-limits GetMicrovm checks on repeated app 404 responses", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
   upstreamHandler = () => new Response("not found", { status: 404 });
@@ -378,7 +362,7 @@ test("アプリ自身の 404 が続いても GetMicrovm を毎回呼ばない", 
   assert.equal(aws.count("run"), 1);
 });
 
-test("アプリ自身の 403 が続いても JWE を毎回再発行しない", async () => {
+test("rate-limits forced JWE refreshes on repeated app 403 responses", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
   upstreamHandler = () => new Response("forbidden", { status: 403 });
@@ -386,10 +370,10 @@ test("アプリ自身の 403 が続いても JWE を毎回再発行しない", a
   for (let i = 0; i < 5; i++) {
     assert.equal((await dObj.fetch(apiRequest("/forbidden"))).status, 403);
   }
-  assert.equal(aws.count("token"), 2, "初回発行 + 強制再発行 1 回");
+  assert.equal(aws.count("token"), 2);
 });
 
-test("トークン失効の 403 は再発行して 1 回リトライする", async () => {
+test("re-issues JWE token and retries once on 403", async () => {
   const { dObj } = setup();
   await dObj.registerImage("img-v1");
   upstreamHandler = (req) =>
@@ -399,21 +383,21 @@ test("トークン失効の 403 は再発行して 1 回リトライする", asy
   assert.deepEqual(upstream.map((u) => u.auth), ["jwe-mvm-1-1", "jwe-mvm-1-2"]);
 });
 
-test("同じ失効トークンで同時に 403 を受けたリクエストは、全員が新トークンで再試行する", async () => {
+test("concurrent requests receiving 403 on the same stale token all retry with one new token", async () => {
   const { aws, dObj } = setup();
   await dObj.registerImage("img-v1");
-  await dObj.fetch(apiRequest("/warm")); // jwe-mvm-1-1 をキャッシュ
+  await dObj.fetch(apiRequest("/warm"));
   upstreamHandler = (req) =>
     new Response("", { status: req.headers.get("X-aws-proxy-auth") === "jwe-mvm-1-1" ? 403 : 200 });
 
   const results = await Promise.all(Array.from({ length: 5 }, (_, i) => dObj.fetch(apiRequest(`/p${i}`))));
   assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200, 200]);
-  assert.equal(aws.count("token"), 2, "再発行は 1 回だけ");
+  assert.equal(aws.count("token"), 2);
 });
 
-// --- 破棄と Alarm ---
+// --- Destroy & Alarms ---
 
-test("destroy でイメージ削除に失敗したら例外を投げ、削除待ちとして Alarm で再試行する", async () => {
+test("destroy: throws CleanupIncompleteError and retries image deletion via Alarm", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/"));
@@ -424,7 +408,6 @@ test("destroy でイメージ削除に失敗したら例外を投げ、削除待
   assert.equal(status.registered, false);
   assert.deepEqual(status.cleanupPending, { microvmIds: [], imageIdentifiers: ["img-v1"] });
   assert.ok(ctx.alarm && ctx.alarm <= Date.now() + CLEANUP_RETRY_DELAY_MS);
-  // 削除待ちが残っていてもプレビューは復活しない
   assert.equal((await dObj.fetch(apiRequest("/"))).status, 404);
 
   aws.deleteImageError = null;
@@ -434,12 +417,11 @@ test("destroy でイメージ削除に失敗したら例外を投げ、削除待
   assert.equal(ctx.alarm, null);
 });
 
-test("destroy: MicroVM が終了しきるのを待ってからイメージを削除する", async () => {
+test("destroy: polls until MicroVM terminates before deleting image", async () => {
   const { aws, dObj, ctx } = setup({ terminationPollIntervalMs: 1, terminationWaitTimeoutMs: 1000 });
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/"));
 
-  // 実際の AWS と同じく、終了は非同期に進み、終了しきるまでイメージを削除できない
   let checks = 0;
   aws.terminatedStateFor = () => (++checks < 3 ? "TERMINATING" : "TERMINATED");
   const realDelete = aws.deleteMicroVmImage;
@@ -457,7 +439,7 @@ test("destroy: MicroVM が終了しきるのを待ってからイメージを削
   assert.equal(ctx.alarm, null);
 });
 
-test("destroy: 終了の待機が上限を過ぎたら削除を試み、失敗分は削除待ちとして Alarm で再試行する", async (t) => {
+test("destroy: queues image for Alarm retry if termination polling times out", async (t) => {
   const { aws, dObj } = setup({ terminationPollIntervalMs: 1, terminationWaitTimeoutMs: 5 });
   t.mock.method(console, "error", () => {});
   await dObj.registerImage("img-v1");
@@ -470,7 +452,6 @@ test("destroy: 終了の待機が上限を過ぎたら削除を試み、失敗�
   const status = await dObj.getStatus();
   assert.deepEqual(status.cleanupPending, { microvmIds: [], imageIdentifiers: ["img-v1"] });
 
-  // 次の Alarm では終了済みなので、待たずに削除できる
   aws.terminatedStateFor = null;
   aws.deleteImageError = null;
   await dObj.alarm();
@@ -478,7 +459,7 @@ test("destroy: 終了の待機が上限を過ぎたら削除を試み、失敗�
   assert.equal((await dObj.getStatus()).cleanupPending, undefined);
 });
 
-test("イメージを削除しない処理（登録時の旧 VM 終了）では、終了を待たない", async () => {
+test("registerImage: does not wait for old MicroVM termination when not deleting image", async () => {
   const { aws, dObj } = setup({ terminationPollIntervalMs: 1, terminationWaitTimeoutMs: 1000 });
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/"));
@@ -489,7 +470,7 @@ test("イメージを削除しない処理（登録時の旧 VM 終了）では�
   assert.equal(aws.count("getState"), 0);
 });
 
-test("削除待ちのイメージが再登録されたら削除対象から外す", async () => {
+test("removes image from pendingCleanup when re-registered", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   aws.deleteImageError = new Error("ThrottlingException");
@@ -500,7 +481,7 @@ test("削除待ちのイメージが再登録されたら削除対象から外�
   assert.equal((await dObj.getStatus()).registered, true);
 });
 
-test("削除待ちの再試行より前に再登録されたイメージは、再試行で削除しない", async () => {
+test("skips deleting an image that was re-registered before Alarm retry reached it", async () => {
   const { aws, dObj, ctx } = setup();
   ctx.data.set("pendingCleanup", {
     microvmIds: [],
@@ -511,8 +492,8 @@ test("削除待ちの再試行より前に再登録されたイメージは、�
   aws.deleteImageGate = gate.promise;
 
   const alarm = dObj.alarm();
-  await tick(); // img-a の削除が進行中（img-b はまだ送信していない）
-  const register = dObj.registerImage("img-b"); // 削除待ちから外したうえで、実行中の再試行の後ろに並ぶ
+  await tick();
+  const register = dObj.registerImage("img-b");
   await tick();
   aws.deleteImageGate = null;
   gate.resolve();
@@ -524,14 +505,14 @@ test("削除待ちの再試行より前に再登録されたイメージは、�
   assert.equal(ctx.data.get("pendingCleanup"), undefined);
 });
 
-test("登録の待機中に同じイメージの削除が完了していたら、登録を拒否する", async () => {
+test("rejects registration with ImageDeletedDuringCleanupError if in-flight deletion succeeded", async () => {
   const { aws, dObj, ctx } = setup();
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
   const gate = deferred();
   aws.deleteImageGate = gate.promise;
 
   const alarm = dObj.alarm();
-  await tick(); // img-a の削除リクエストが AWS に送信済み
+  await tick();
   const register = dObj.registerImage("img-a");
   gate.resolve();
   await alarm;
@@ -540,17 +521,17 @@ test("登録の待機中に同じイメージの削除が完了していたら�
   assert.equal((await dObj.getStatus()).registered, false);
 });
 
-test("登録が旧 VM の終了を待っている間に始まった削除の再試行は、登録するイメージを消さない", async () => {
+test("queued Alarm retry does not delete image being registered while waiting on old VM termination", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-old");
-  await dObj.fetch(apiRequest("/")); // mvm-1 起動
+  await dObj.fetch(apiRequest("/"));
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
   const gate = deferred();
   aws.terminateGate = gate.promise;
 
-  const register = dObj.registerImage("img-a"); // 旧 VM (mvm-1) の終了待ちで止まる
+  const register = dObj.registerImage("img-a");
   await tick();
-  const alarm = dObj.alarm(); // 登録の後ろに並ぶ
+  const alarm = dObj.alarm();
   await tick();
   aws.terminateGate = null;
   gate.resolve();
@@ -561,7 +542,7 @@ test("登録が旧 VM の終了を待っている間に始まった削除の再�
   assert.equal((await dObj.getStatus()).imageIdentifier, "img-a");
 });
 
-test("古くなった起動結果の VM の終了に失敗したら、削除待ちとして Alarm で再試行する", async () => {
+test("queues stale booted MicroVM for Alarm retry if termination fails", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -584,7 +565,7 @@ test("古くなった起動結果の VM の終了に失敗したら、削除待�
   assert.equal(ctx.data.get("pendingCleanup"), undefined);
 });
 
-test("destroy: 削除対象を永続化できなければ状態を消さない", async () => {
+test("destroy: preserves state if pendingCleanup cannot be persisted", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const put = ctx.storage.put;
@@ -596,7 +577,7 @@ test("destroy: 削除対象を永続化できなければ状態を消さない",
   assert.equal((await dObj.getStatus()).imageIdentifier, "img-v1");
 });
 
-test("destroy が重なっても、先に失敗した削除対象を後続が消さない", async () => {
+test("concurrent destroy calls do not drop previously failed cleanup targets", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -605,7 +586,7 @@ test("destroy が重なっても、先に失敗した削除対象を後続が消
 
   const first = dObj.destroy();
   await tick();
-  const second = dObj.destroy(); // 1 回目の後ろに並ぶ
+  const second = dObj.destroy();
   await tick();
   gate.resolve();
   await assert.rejects(first, { name: "CleanupIncompleteError" });
@@ -615,11 +596,11 @@ test("destroy が重なっても、先に失敗した削除対象を後続が消
   assert.ok(ctx.alarm);
 });
 
-test("削除待ちのイメージの再登録が失敗したら、削除待ちに戻す", async () => {
+test("keeps image in pendingCleanup if re-registration fails on state write", async () => {
   const { dObj, ctx } = setup();
   const retryAt = Date.now() + 1000;
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt });
-  ctx.alarm = retryAt; // 削除待ちの作成時に設定される Alarm
+  ctx.alarm = retryAt;
   const put = ctx.storage.put;
   ctx.storage.put = async (key, value) => {
     if (key === "state") throw new Error("storage unavailable");
@@ -628,10 +609,10 @@ test("削除待ちのイメージの再登録が失敗したら、削除待ち�
 
   await assert.rejects(dObj.registerImage("img-a"), /storage unavailable/);
   assert.deepEqual(ctx.data.get("pendingCleanup").imageIdentifiers, ["img-a"]);
-  assert.ok(ctx.alarm, "再試行の Alarm が設定されている");
+  assert.ok(ctx.alarm);
 });
 
-test("destroy で状態の削除に失敗しても、破棄済みとして扱い Alarm で削除を再試行する", async () => {
+test("treats environment as destroyed and retries deletion via Alarm if state.delete fails", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   await dObj.fetch(apiRequest("/"));
@@ -642,7 +623,7 @@ test("destroy で状態の削除に失敗しても、破棄済みとして扱い
   };
 
   await assert.rejects(dObj.destroy(), /storage unavailable/);
-  assert.equal((await dObj.fetch(apiRequest("/"))).status, 404, "破棄途中の環境を再起動しない");
+  assert.equal((await dObj.fetch(apiRequest("/"))).status, 404);
   assert.equal((await dObj.getStatus()).registered, false);
   assert.equal(aws.count("run"), 1);
 
@@ -653,7 +634,7 @@ test("destroy で状態の削除に失敗しても、破棄済みとして扱い
   assert.ok(aws.terminated.includes("mvm-1"));
 });
 
-test("古くなった起動結果の VM を永続化できなければ、直接終了する", async () => {
+test("terminates stale booted VM directly if pendingCleanup write fails", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   const gate = deferred();
@@ -674,17 +655,17 @@ test("古くなった起動結果の VM を永続化できなければ、直接�
   assert.ok(aws.terminated.includes("mvm-1"));
 });
 
-test("キューに先に並んだ destroy は、後ろに並んだ同じイメージの登録を消さない", async () => {
+test("earlier destroy in queue does not delete a subsequent registration of the same image", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-a");
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-z"], retryAt: Date.now() });
   const gate = deferred();
   aws.deleteImageGate = gate.promise;
 
-  const alarm = dObj.alarm(); // img-z の削除中にキューを占有
+  const alarm = dObj.alarm();
   await tick();
-  const destroy = dObj.destroy(); // 開始時に img-a を削除対象に入れる
-  const register = dObj.registerImage("img-a"); // destroy の後ろに並ぶ
+  const destroy = dObj.destroy();
+  const register = dObj.registerImage("img-a");
   await tick();
   aws.deleteImageGate = null;
   gate.resolve();
@@ -696,21 +677,21 @@ test("キューに先に並んだ destroy は、後ろに並んだ同じイメ�
   assert.equal((await dObj.getStatus()).imageIdentifier, "img-a");
 });
 
-test("Alarm: 掃除期限はキューの中で判定し、先に並んだ登録で更新された環境を消さない", async () => {
+test("Alarm: evaluates zombieAt inside exclusive queue so newer registrations are preserved", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-old");
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-z"], retryAt: Date.now() });
   const gate = deferred();
   aws.deleteImageGate = gate.promise;
 
-  const first = dObj.alarm(); // 期限前なので削除の再試行だけ（img-z の削除中にキューを占有）
+  const first = dObj.alarm();
   await tick();
   const state = ctx.data.get("state");
-  state.zombieAt = Date.now() - 1; // ここで掃除期限を過ぎる
+  state.zombieAt = Date.now() - 1;
   ctx.data.set("state", state);
   const register = dObj.registerImage("img-new");
-  await tick(); // 登録がキューに並ぶのを待つ
-  const second = dObj.alarm(); // 登録の後ろに並ぶ
+  await tick();
+  const second = dObj.alarm();
   await tick();
   aws.deleteImageGate = null;
   gate.resolve();
@@ -721,19 +702,19 @@ test("Alarm: 掃除期限はキューの中で判定し、先に並んだ登録�
   assert.equal((await dObj.getStatus()).imageIdentifier, "img-new");
 });
 
-test("登録時の旧 VM 終了では、ほかの削除待ちの再試行時刻を延ばさない", async () => {
+test("partial cleanup on registerImage preserves retryAt for unrelated pending items", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
-  await dObj.fetch(apiRequest("/")); // mvm-1 起動
+  await dObj.fetch(apiRequest("/"));
   const retryAt = Date.now() + 1000;
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-z"], retryAt });
 
-  await dObj.registerImage("img-v2"); // mvm-1 だけを終了する部分クリーンアップ
+  await dObj.registerImage("img-v2");
   assert.equal(ctx.data.get("pendingCleanup").retryAt, retryAt);
   assert.equal(ctx.alarm, retryAt);
 });
 
-test("再登録が失敗したとき、削除待ちを書き戻せない状況でもイメージを削除待ちに残す", async () => {
+test("preserves pendingCleanup even when both state and pendingCleanup writes fail on re-register", async () => {
   const { dObj, ctx } = setup();
   ctx.data.set("pendingCleanup", { microvmIds: [], imageIdentifiers: ["img-a"], retryAt: Date.now() });
   const put = ctx.storage.put;
@@ -746,7 +727,7 @@ test("再登録が失敗したとき、削除待ちを書き戻せない状況�
   assert.deepEqual(ctx.data.get("pendingCleanup").imageIdentifiers, ["img-a"]);
 });
 
-test("破棄途中の環境への再登録が失敗しても、破棄の意図は残り古い環境は有効に戻らない", async () => {
+test("failed re-registration on destroying environment does not resurrect old state", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-old");
   const del = ctx.storage.delete;
@@ -754,7 +735,7 @@ test("破棄途中の環境への再登録が失敗しても、破棄の意図�
     if (key === "state") throw new Error("storage unavailable");
     return del(key);
   };
-  await assert.rejects(dObj.destroy()); // 状態の削除に失敗し、破棄の意図が残る
+  await assert.rejects(dObj.destroy());
   ctx.storage.delete = del;
 
   const put = ctx.storage.put;
@@ -770,7 +751,7 @@ test("破棄途中の環境への再登録が失敗しても、破棄の意図�
   assert.equal(aws.count("run"), 0);
 });
 
-test("Alarm: クリーンアップ以外の失敗は再送出し、プラットフォームの自動リトライに任せる", async () => {
+test("Alarm: rethrows non-cleanup errors so platform retries Alarm", async () => {
   const { dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
   ctx.storage.get = async () => {
@@ -779,18 +760,16 @@ test("Alarm: クリーンアップ以外の失敗は再送出し、プラット�
   await assert.rejects(dObj.alarm(), /storage unavailable/);
 });
 
-test("Alarm: 掃除期限を過ぎた環境は破棄し、期限前なら削除待ちの再試行だけ行う", async () => {
+test("Alarm: retries pending cleanup before zombieAt and destroys environment after zombieAt", async () => {
   const { aws, dObj, ctx } = setup();
   await dObj.registerImage("img-v1");
 
-  // 期限前: 削除待ちだけ再試行し、登録は残す
   ctx.data.set("pendingCleanup", { microvmIds: ["mvm-old"], imageIdentifiers: [], retryAt: Date.now() });
   await dObj.alarm();
   assert.ok(aws.terminated.includes("mvm-old"));
   assert.equal((await dObj.getStatus()).registered, true);
-  assert.ok(ctx.alarm > Date.now() + 13 * 24 * 60 * 60 * 1000, "次の Alarm は掃除期限");
+  assert.ok(ctx.alarm > Date.now() + 13 * 24 * 60 * 60 * 1000);
 
-  // 期限切れ: 破棄する
   const state = ctx.data.get("state");
   state.zombieAt = Date.now() - 1;
   ctx.data.set("state", state);
@@ -799,19 +778,19 @@ test("Alarm: 掃除期限を過ぎた環境は破棄し、期限前なら削除�
   assert.ok(aws.calls.some(([k, id]) => k === "deleteImage" && id === "img-v1"));
 });
 
-test("zombieAt のない旧バージョンの状態は、Alarm 発火時に従来どおり破棄する", async () => {
+test("Alarm: destroys legacy state without zombieAt", async () => {
   const { dObj, ctx } = setup();
   ctx.data.set("state", { imageIdentifier: "img-legacy", updatedAt: Date.now() });
   await dObj.alarm();
   assert.equal(ctx.data.size, 0);
 });
 
-// --- コールドスタート判定 ---
+// --- Cold-Start Detection ---
 
-test("Turbo / fetch など非ナビゲーションのリクエストにはローディング画面を返さない", () => {
+test("does not serve cold-start loading page for non-navigation requests (e.g. Turbo / fetch)", () => {
   const req = (headers) => new Request("https://pr-1.preview.example.com/", { headers });
   assert.equal(acceptsHtmlBrowserRequest(req({ Accept: "text/html", "Sec-Fetch-Mode": "navigate" })), true);
-  assert.equal(acceptsHtmlBrowserRequest(req({ Accept: "text/html" })), true, "Sec-Fetch-Mode なしは従来どおり");
+  assert.equal(acceptsHtmlBrowserRequest(req({ Accept: "text/html" })), true);
   assert.equal(
     acceptsHtmlBrowserRequest(req({ Accept: "text/vnd.turbo-stream.html, text/html", "Sec-Fetch-Mode": "cors" })),
     false

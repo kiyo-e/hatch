@@ -2,7 +2,7 @@
   "rules": [
     {
       "rulePriority": 1,
-      "description": "同じブランチのタグで push し直して、タグが外れた古いイメージを 1 日で消す",
+      "description": "Expire untagged images superseded by a newer push on the same branch after 1 day",
       "selection": {
         "tagStatus": "untagged",
         "countType": "sinceImagePushed",
@@ -13,7 +13,7 @@
     },
     {
       "rulePriority": 2,
-      "description": "片付けで消し損ねたブランチのタグも、30 日 push が無ければ消す（プレビュー専用のリポジトリで使う）",
+      "description": "Expire any remaining branch tags with no pushes for 30 days (for preview-only repositories)",
       "selection": {
         "tagStatus": "any",
         "countType": "sinceImagePushed",

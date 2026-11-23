@@ -7,12 +7,6 @@ function escapeHtml(input: string): string {
     .replace(/'/g, "&#39;");
 }
 
-/**
- * 利用者に見せる 2 つの画面（起動中・起動失敗）の共通の枠。
- * - OS のライト / ダークに追従する
- * - 狭い画面でもカードの左右に余白を残す（padding を幅に含め、body にも余白を取る）
- * - 日本語は文節で改行し、行の長さをそろえて末尾の 1〜2 文字だけが次の行に残らないようにする
- */
 function renderStatusPage(options: {
   title: string;
   envLabel: string;
@@ -25,7 +19,7 @@ function renderStatusPage(options: {
   const spinner =
     options.variant === "starting" ? `<div class="spinner" aria-hidden="true"></div>\n    ` : "";
   return `<!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -54,7 +48,7 @@ function renderStatusPage(options: {
       padding: 24px 16px;
       display: grid;
       place-items: center;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: var(--bg);
       color: var(--fg);
     }
@@ -107,8 +101,7 @@ function renderStatusPage(options: {
 }
 
 /**
- * コールドスタート中（run-microvm 実行中）にブラウザリクエストへ即返す軽量ローディング画面。
- * 3 秒ごとに自動リロードし、起動完了次第シームレスにアプリ画面へ遷移する。
+ * Lightweight auto-reloading page returned to browsers during MicroVM cold start.
  */
 export function renderColdStartResponse(envLabel: string, retryAfterSeconds = 3): Response {
   const html = renderStatusPage({
@@ -116,8 +109,8 @@ export function renderColdStartResponse(envLabel: string, retryAfterSeconds = 3)
     envLabel,
     retryAfterSeconds,
     variant: "starting",
-    heading: "プレビュー環境を起動しています…",
-    lines: ["スナップショットから MicroVM を復元中です。", `${retryAfterSeconds} 秒後に自動で再読み込みします。`],
+    heading: "Starting preview environment…",
+    lines: ["Restoring MicroVM from snapshot.", `Reloading automatically in ${retryAfterSeconds} seconds.`],
   });
 
   return new Response(html, {
@@ -131,8 +124,7 @@ export function renderColdStartResponse(envLabel: string, retryAfterSeconds = 3)
 }
 
 /**
- * MicroVM の起動に失敗したときにブラウザへ返す画面。AWS のエラー内容は含めない。
- * 「起動中」画面を出し続けて利用者を待たせないよう、失敗であることを明示する。
+ * Error page returned to browsers when MicroVM provisioning fails (never exposes AWS errors).
  */
 export function renderBootFailedResponse(envLabel: string, retryAfterSeconds: number): Response {
   const html = renderStatusPage({
@@ -140,8 +132,8 @@ export function renderBootFailedResponse(envLabel: string, retryAfterSeconds: nu
     envLabel,
     retryAfterSeconds,
     variant: "failed",
-    heading: "プレビュー環境の起動に失敗しました",
-    lines: [`${retryAfterSeconds} 秒後に自動で再試行します。`, "繰り返し失敗する場合は、管理者に連絡してください。"],
+    heading: "Failed to start preview environment",
+    lines: [`Retrying automatically in ${retryAfterSeconds} seconds.`, "If this persists, please contact an administrator."],
   });
 
   return new Response(html, {
@@ -162,8 +154,7 @@ export function acceptsHtmlBrowserRequest(request: Request): boolean {
   if (upgrade && upgrade.toLowerCase() === "websocket") {
     return false;
   }
-  // fetch / XHR（Turbo・htmx 等）は Accept に text/html を含んでもページ遷移ではないため除外する。
-  // Sec-Fetch-Mode を送らない古いクライアントは従来どおり Accept だけで判定する
+  // Exclude fetch/XHR (e.g. Turbo, htmx) that include text/html in Accept; allow clients omitting Sec-Fetch-Mode.
   const fetchMode = request.headers.get("Sec-Fetch-Mode");
   if (fetchMode && fetchMode !== "navigate") {
     return false;
