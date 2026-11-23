@@ -44,6 +44,8 @@ jobs:
             -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}"
 
       - name: Drop the preview database
+        id: drop
+        continue-on-error: true # 失敗しても ECR と S3 の片付けは続ける（DB は preview-sweep.yml でも消す）
         env:
           DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
         run: |
@@ -61,8 +63,11 @@ jobs:
           aws ecr batch-delete-image --repository-name "$REPOSITORY" --image-ids "imageTag=${tag}" >/dev/null
           aws s3 rm "s3://${ARTIFACT_BUCKET}/${IMAGE_NAME}/" --recursive >/dev/null
 
-      - name: Fail if hatch could not finish the destroy
-        if: steps.destroy.outcome == 'failure'
+      - name: Fail if the destroy or the database drop did not finish
+        if: steps.destroy.outcome == 'failure' || steps.drop.outcome == 'failure'
+        env:
+          DESTROY: ${{ steps.destroy.outcome }}
+          DROP: ${{ steps.drop.outcome }}
         run: |
-          echo "::error::hatch の破棄が完了していません。残りは hatch が自動で再試行し、preview-sweep.yml でも片付けます"
+          echo "::error::片付けが完了していません（hatch の破棄: ${DESTROY} / DB の削除: ${DROP}）。残りは hatch の再試行と preview-sweep.yml で片付けます"
           exit 1

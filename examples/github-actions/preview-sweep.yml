@@ -35,8 +35,14 @@ jobs:
       - name: Sweep previews of closed PRs
         run: |
           sudo apt-get install -y -qq postgresql-client >/dev/null
-          open_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 1000 --json number --jq '.[].number')"
-          is_open() { grep -qx "$1" <<<"$open_prs"; }
+          # PR ごとに状態を確かめる。閉じている（CLOSED / MERGED）と確かめられたものだけを片付け、
+          # 開いているものや、状態を取れなかったもの（削除された PR など）は残す
+          is_closed() {
+            case "$(gh pr view "$1" --repo "$GITHUB_REPOSITORY" --json state --jq .state 2>/dev/null)" in
+              CLOSED | MERGED) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
 
           # 1. PR 用のデータベース
           dbs="$(psql "${DATABASE_URL_BASE}/postgres" -Atc "SELECT datname FROM pg_database WHERE datname ~ '^preview_pr_[0-9]+$'")"
@@ -45,7 +51,7 @@ jobs:
 
           numbers="$( { sed -n 's/^preview_pr_//p' <<<"$dbs"; sed -n 's/^preview-pr-//p' <<<"$images"; } | sort -un)"
           for n in $numbers; do
-            is_open "$n" && continue
+            is_closed "$n" || continue
             echo "sweeping PR #${n}"
             # hatch の破棄は何度呼んでもよい（登録が無ければ何もしない）。失敗しても続ける
             curl -sS -o /dev/null -w "  hatch destroy: %{http_code}\n" -X DELETE \

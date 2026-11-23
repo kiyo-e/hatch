@@ -117,7 +117,15 @@ jobs:
           VERSION: ${{ steps.microvm.outputs.image_version }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          body="プレビュー: ${URL}（イメージ ${IMAGE_NAME} ${VERSION} / ${GITHUB_SHA::7}）"
-          # 2 回目以降は、前回のコメントを書き換える
-          gh pr comment "$PR_NUMBER" --edit-last --body "$body" 2>/dev/null \
-            || gh pr comment "$PR_NUMBER" --body "$body"
+          marker='<!-- hatch-preview -->'
+          body="${marker}
+          プレビュー: ${URL}（イメージ ${IMAGE_NAME} ${VERSION} / ${GITHUB_SHA::7}）"
+          # 2 回目以降は、目印の付いたこのワークフローのコメントだけを書き換える
+          # （--edit-last は github-actions[bot] の最後のコメントなので、ほかのワークフローのコメントを上書きしうる）
+          comment_id="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" | tail -n 1)"
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body "$body"
+          fi
