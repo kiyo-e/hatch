@@ -47,15 +47,21 @@ jobs:
           # 1. PR 用のデータベース
           dbs="$(psql "${DATABASE_URL_BASE}/postgres" -Atc "SELECT datname FROM pg_database WHERE datname ~ '^preview_pr_[0-9]+$'")"
           # 2. MicroVM イメージ
-          images="$(aws lambda-microvms list-microvm-images --query 'items[].name' --output text | tr '\t' '\n' | grep -E '^preview-pr-[0-9]+$' || true)"
+          # 一覧の取得に失敗したらジョブを失敗にする（該当なしだけを許す）
+          all_images="$(aws lambda-microvms list-microvm-images --query 'items[].name' --output text)"
+          images="$(tr '\t' '\n' <<<"$all_images" | grep -E '^preview-pr-[0-9]+$' || true)"
 
           numbers="$( { sed -n 's/^preview_pr_//p' <<<"$dbs"; sed -n 's/^preview-pr-//p' <<<"$images"; } | sort -un)"
           for n in $numbers; do
             is_closed "$n" || continue
             echo "sweeping PR #${n}"
-            # hatch の破棄は何度呼んでもよい（登録が無ければ何もしない）。失敗しても続ける
-            curl -sS -o /dev/null -w "  hatch destroy: %{http_code}\n" -X DELETE \
-              "${API_BASE_URL}/api/envs/pr-${n}/destroy" -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}" || true
+            # hatch の破棄は何度呼んでもよい（登録が無ければ何もしない）。失敗したらこの PR は残し、
+            # 次回の sweep で再試行する（イメージと DB を消すと、次回この PR を見つけられなくなるため）
+            if ! curl --fail-with-body -sS -o /dev/null -X DELETE \
+              "${API_BASE_URL}/api/envs/pr-${n}/destroy" -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}"; then
+              echo "  ::warning::hatch destroy failed for pr-${n}; will retry next time"
+              continue
+            fi
             if grep -qx "preview-pr-${n}" <<<"$images"; then
               account="$(aws sts get-caller-identity --query Account --output text)"
               aws lambda-microvms delete-microvm-image \
