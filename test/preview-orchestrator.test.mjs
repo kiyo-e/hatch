@@ -15,7 +15,7 @@ test("wrangler.jsonc は SQLite Durable Object マイグレーションと必須
   const stripped = raw.replace(/^\s*\/\/.*$/gm, "");
   const config = JSON.parse(stripped);
 
-  assert.equal(config.name, "preview-orchestrator");
+  assert.equal(config.name, "hatch");
   assert.equal(config.main, "src/index.ts");
   assert.ok(config.compatibility_flags.includes("nodejs_compat"));
   assert.deepEqual(config.durable_objects.bindings, [
