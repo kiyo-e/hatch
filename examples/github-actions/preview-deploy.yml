@@ -56,9 +56,10 @@ jobs:
         env:
           REPOSITORY: ${{ steps.ecr.outputs.registry }}/${{ vars.PREVIEW_ECR_REPOSITORY }}
         run: |
-          # ECR のタグに使えない文字（/ など）を - にする。同じブランチは同じタグを上書きし、
-          # 古いイメージはタグなしになって ECR のライフサイクルで消える
-          tag="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
+          # タグは pr-<番号>-<ブランチ名>。ECR のタグに使えない文字（/ や日本語など）を - にし、
+          # 先頭は英数字にする（ブランチ名が記号や日本語で始まってもタグとして有効にするため）。
+          # 同じブランチは同じタグを上書きし、古いイメージはタグなしになって ECR のライフサイクルで消える
+          tag="$(printf '%s-%s' "$ENV_ID" "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
           # --load で DB のセットアップ用に手元にも残し、push した digest は metadata から取る
           # （docker inspect の RepoDigests は、ビルダーによってはタグの付いていない子マニフェストを指す）
           docker buildx build --platform linux/arm64 --provenance=false \

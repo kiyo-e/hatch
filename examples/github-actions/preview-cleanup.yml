@@ -59,9 +59,12 @@ jobs:
           REPOSITORY: ${{ vars.PREVIEW_ECR_REPOSITORY }}
           ARTIFACT_BUCKET: ${{ vars.PREVIEW_ARTIFACT_BUCKET }}
         run: |
-          tag="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
-          aws ecr batch-delete-image --repository-name "$REPOSITORY" --image-ids "imageTag=${tag}" >/dev/null
-          aws s3 rm "s3://${ARTIFACT_BUCKET}/${IMAGE_NAME}/" --recursive >/dev/null
+          tag="$(printf '%s-%s' "$ENV_ID" "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
+          # 片方が失敗しても、もう片方は実行する（S3 は preview-sweep.yml でも拾わないため）
+          failed=0
+          aws ecr batch-delete-image --repository-name "$REPOSITORY" --image-ids "imageTag=${tag}" >/dev/null || failed=1
+          aws s3 rm "s3://${ARTIFACT_BUCKET}/${IMAGE_NAME}/" --recursive >/dev/null || failed=1
+          exit "$failed"
 
       - name: Fail if the destroy or the database drop did not finish
         if: steps.destroy.outcome == 'failure' || steps.drop.outcome == 'failure'
