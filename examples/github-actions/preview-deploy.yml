@@ -1,31 +1,123 @@
-name: Register PR Preview Environment
+# PR の作成・更新のたびに、プレビュー環境を作り直す（アプリ側のリポジトリに置く例）。
+#
+#   1. アプリのコンテナイメージを arm64 でビルドし、ECR にブランチ名のタグで push する（同じタグを上書き）
+#   2. そのイメージで、外部 DB に PR 用のデータベースを作り、スキーマと seed を流す（何度実行しても同じ結果になること）
+#   3. MicroVM イメージを PR ごとに 1 つの名前で作る / 更新する（新しいバージョンが足される）
+#   4. hatch に登録する（同じ ARN の再登録で、古い MicroVM を止めて最新のバージョンで起動し直す）
+#   5. MicroVM イメージの古いバージョンを消す
+#
+# 必要な設定（README の「アプリ側の CI 例」を参照）:
+#   vars:    AWS_REGION, PREVIEW_CI_ROLE_ARN, PREVIEW_ECR_REPOSITORY, PREVIEW_ARTIFACT_BUCKET,
+#            PREVIEW_BUILD_ROLE_ARN, HATCH_API_BASE_URL, PREVIEW_BASE_DOMAIN,
+#            PREVIEW_DB_SETUP_COMMAND（任意。既定 bin/rails db:prepare）, PREVIEW_EGRESS_CONNECTOR（任意）
+#   secrets: CI_WEBHOOK_SECRET, PREVIEW_DATABASE_URL_BASE（例: postgres://user:pass@db.example.internal:5432）
+#   files:   examples/github-actions/scripts/*.sh を .github/hatch/ にコピーする
+name: Deploy PR Preview
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# 同じ PR のデプロイと片付けは順番に実行する（ビルド中のイメージを途中で止めない）
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # AWS への OIDC 認証
+  contents: read
+  pull-requests: write # PR へのコメント
+
 jobs:
-  register-preview:
-    runs-on: ubuntu-latest
+  deploy:
+    # フォークからの PR にはシークレットが渡らないため実行しない
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    # MicroVM は arm64 なので、arm64 のランナーでそのままビルドする
+    runs-on: ubuntu-24.04-arm
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ENV_ID: pr-${{ github.event.pull_request.number }}
+      IMAGE_NAME: preview-pr-${{ github.event.pull_request.number }}
+      DB_NAME: preview_pr_${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
       - uses: actions/checkout@v4
 
-      # TODO: ここで Dockerfile + S3 zip から `aws lambda-microvms create-microvm-image` を実行し、
-      # ビルド完了したイメージ ARN を IMAGE_ARN に出力してください。
-      - name: Build MicroVM Image (placeholder)
-        id: build
-        run: |
-          echo "image_arn=arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PREVIEW_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Register image to Cloudflare Workers Orchestrator
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the app image (tag = branch name)
+        id: image
+        env:
+          REPOSITORY: ${{ steps.ecr.outputs.registry }}/${{ vars.PREVIEW_ECR_REPOSITORY }}
+        run: |
+          # ECR のタグに使えない文字（/ など）を - にする。同じブランチは同じタグを上書きし、
+          # 古いイメージはタグなしになって ECR のライフサイクルで消える
+          tag="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
+          # --load で DB のセットアップ用に手元にも残し、push した digest は metadata から取る
+          # （docker inspect の RepoDigests は、ビルダーによってはタグの付いていない子マニフェストを指す）
+          docker buildx build --platform linux/arm64 --provenance=false \
+            -t "${REPOSITORY}:${tag}" --push --load --metadata-file "$RUNNER_TEMP/image-meta.json" .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image-meta.json")"
+          echo "local=${REPOSITORY}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "pinned=${REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up the preview database (create + schema + seed)
+        env:
+          DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
+          SETUP_COMMAND: ${{ vars.PREVIEW_DB_SETUP_COMMAND || 'bin/rails db:prepare' }}
+          APP_IMAGE: ${{ steps.image.outputs.local }}
+        run: |
+          # ランナーから DB に届く必要がある（届かない場合は、VPC 内のセルフホストランナーや ECS の one-off タスクで実行する）
+          # shellcheck disable=SC2086
+          docker run --rm \
+            -e DATABASE_URL="${DATABASE_URL_BASE}/${DB_NAME}" \
+            -e RAILS_ENV=production -e SECRET_KEY_BASE_DUMMY=1 \
+            "$APP_IMAGE" $SETUP_COMMAND
+
+      - name: Build the MicroVM image
+        id: microvm
+        env:
+          CONTAINER_IMAGE: ${{ steps.image.outputs.pinned }}
+          ARTIFACT_BUCKET: ${{ vars.PREVIEW_ARTIFACT_BUCKET }}
+          BUILD_ROLE_ARN: ${{ vars.PREVIEW_BUILD_ROLE_ARN }}
+          EGRESS_CONNECTOR: ${{ vars.PREVIEW_EGRESS_CONNECTOR }}
+          DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
+        run: |
+          # イメージに渡す環境変数（イメージの設定として保存されるため、閲覧できる人を IAM で絞ること）
+          ENVIRONMENT_JSON="$(jq -cn --arg url "${DATABASE_URL_BASE}/${DB_NAME}" '{DATABASE_URL: $url}')"
+          export ENVIRONMENT_JSON
+          .github/hatch/build-microvm-image.sh
+
+      - name: Register to hatch
         env:
           CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
-          API_BASE_URL: https://api.preview.example.com
-          ENV_ID: pr-${{ github.event.pull_request.number }}
-          IMAGE_ARN: ${{ steps.build.outputs.image_arn }}
+          API_BASE_URL: ${{ vars.HATCH_API_BASE_URL }}
+          IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
         run: |
-          curl --fail-with-body -sS -X POST \
-            "${API_BASE_URL}/api/envs/${ENV_ID}/register" \
+          curl --fail-with-body -sS -X POST "${API_BASE_URL}/api/envs/${ENV_ID}/register" \
             -H "Content-Type: application/json" \
             -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}" \
-            -d "{\"imageIdentifier\":\"${IMAGE_ARN}\"}"
+            -d "$(jq -cn --arg image "$IMAGE_ARN" '{imageIdentifier: $image}')"
+
+      - name: Prune old MicroVM image versions
+        env:
+          IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
+        run: .github/hatch/prune-microvm-image-versions.sh
+
+      - name: Comment the preview URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: https://${{ env.ENV_ID }}.${{ vars.PREVIEW_BASE_DOMAIN }}/
+          VERSION: ${{ steps.microvm.outputs.image_version }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          body="プレビュー: ${URL}（イメージ ${IMAGE_NAME} ${VERSION} / ${GITHUB_SHA::7}）"
+          # 2 回目以降は、前回のコメントを書き換える
+          gh pr comment "$PR_NUMBER" --edit-last --body "$body" 2>/dev/null \
+            || gh pr comment "$PR_NUMBER" --body "$body"

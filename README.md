@@ -46,9 +46,13 @@
 │   ├── router.test.mjs                # 管理 API の入力検証
 │   ├── admin.test.mjs                 # 管理画面・台帳
 │   └── preview-orchestrator.test.mjs  # 設定・ソースの契約
-├── examples/github-actions/   # アプリ側リポジトリに置く CI の例（このリポジトリでは実行されない）
-│   ├── preview-deploy.yml   # PR 更新時のイメージ登録例
-│   └── preview-cleanup.yml  # PR クローズ時の削除例
+├── examples/                 # アプリ側に置く例（このリポジトリでは実行されない）
+│   ├── github-actions/
+│   │   ├── preview-deploy.yml   # PR の作成・更新: イメージのビルド・DB のセットアップ・登録
+│   │   ├── preview-cleanup.yml  # PR のクローズ: 破棄と DB などの片付け
+│   │   ├── preview-sweep.yml    # 毎日: 閉じた PR の取り残しを片付ける
+│   │   └── scripts/             # MicroVM イメージの作成・更新と、古いバージョンの削除
+│   └── aws/                     # ECR のライフサイクル、CI 用ロール・ビルドロールのポリシー
 ├── wrangler.jsonc
 ├── package.json
 ├── tsconfig.json
@@ -167,14 +171,58 @@ Worker に渡す IAM ユーザーには以下のアクションを許可して�
 
 ## アプリ側の CI 例（GitHub Actions）
 
-[`examples/github-actions/`](examples/github-actions/) に、プレビューしたいアプリ側のリポジトリに置く GitHub Actions の例があります。PR の作成・更新時にイメージを登録し、PR のクローズ時に破棄します。
+[`examples/github-actions/`](examples/github-actions/) に、プレビューしたいアプリ側のリポジトリに置くワークフローの例があります。DB は、アプリとは別の外部 DB（PostgreSQL）に PR ごとのデータベースを作る前提です。
 
-1. 2 つのファイルをアプリ側リポジトリの `.github/workflows/` にコピーします。
-2. `API_BASE_URL` を本 Worker の管理 API のホスト（`API_HOSTNAME`）に合わせます。
-3. アプリ側リポジトリのシークレットに `CI_WEBHOOK_SECRET` を登録します。
-4. `preview-deploy.yml` のイメージビルド手順（`TODO`）を、実際に MicroVM イメージを作成して ARN を出力する処理に置き換えます。
+| ワークフロー | タイミング | やること |
+| :--- | :--- | :--- |
+| `preview-deploy.yml` | PR の作成・更新 | アプリのイメージを ECR に push → PR 用 DB の作成と seed → MicroVM イメージの作成 / 更新 → hatch に登録 → 古いバージョンの削除 → PR にプレビューの URL をコメント |
+| `preview-cleanup.yml` | PR のクローズ | hatch で破棄 → PR 用 DB の削除 → ECR のタグと S3 の成果物の削除 |
+| `preview-sweep.yml` | 毎日 / 手動 | 閉じた PR の DB と MicroVM イメージの取り残しを片付ける |
 
-フォークからの PR ではシークレットが渡らないため、必要に応じてジョブに `if: github.event.pull_request.head.repo.full_name == github.repository` を追加してください。
+### イメージの持ち方
+
+- **コンテナイメージ（ECR）**: ブランチ名をタグにして push し、同じブランチは同じタグを上書きします。タグの外れた古いイメージは、ECR のライフサイクル（[`examples/aws/ecr-lifecycle-policy.json`](examples/aws/ecr-lifecycle-policy.json)）で消えます。プレビュー専用のリポジトリを使ってください。
+- **MicroVM イメージ**: PR ごとに 1 つの名前（`preview-pr-<番号>`）で作り、push のたびに `update-microvm-image` で新しいバージョンを足します。イメージの数は PR の数で済み（1 リージョン 100 個まで）、バージョンは新しい 2 つだけを残して消します（1 イメージ 50 個まで）。直前のバージョンは、hatch が終了させたばかりの MicroVM がまだ使っていることがあるため残します。
+- hatch には同じ ARN を登録し直します。hatch は古い MicroVM を終了し、次のアクセスで最新のバージョンから起動します。
+- MicroVM は arm64 なので、アプリのイメージは arm64 でビルドします（例では arm64 のランナーを使います）。ベースのコンテナイメージは、公開イメージか同じアカウントの ECR から取得できるものに限られます。
+- MicroVM イメージは、アプリのイメージを digest で指定した `FROM` に、どのイメージから作ったかを書いた小さなファイルを `COPY` する Dockerfile から作ります。`FROM` だけで新しいレイヤーが無いと、OCI 形式で push したイメージ（`docker buildx` の既定）のビルドが `An unknown error occurred.` で失敗するためです。ビルドロールには、ECR から pull する権限が必要です。
+
+この流れ（作成 → 同じ名前での更新 → 再登録で最新のバージョンに切り替わる → 古いバージョンの削除 → バージョンが複数あるイメージの hatch での破棄）は、実際の AWS で確認しています。
+
+### DB のセットアップ
+
+ビルドしたアプリのイメージで `PREVIEW_DB_SETUP_COMMAND`（既定 `bin/rails db:prepare`）を実行します。データベースが無ければ作ってスキーマと seed を流し、あればマイグレーションだけを流すように、何度実行しても同じ結果になるコマンドにしてください。GitHub のランナーから DB に届く必要があります。届かない場合は、VPC 内のセルフホストランナーや ECS の one-off タスクで実行してください。
+
+MicroVM から VPC 内の DB に接続するには、egress の Network Connector を作り、`PREVIEW_EGRESS_CONNECTOR`（イメージのビルド時）と hatch の `AWS_EGRESS_NETWORK_CONNECTORS`（実行時）に設定します。
+
+### 片付け
+
+PR のクローズ時に片付けます。ただし、このジョブの失敗、hatch の自動破棄（放置 `ZOMBIE_TTL_DAYS` 日）、管理画面からの破棄では DB が残るため、`preview-sweep.yml` が毎日、開いていない PR の DB と MicroVM イメージを消します。AWS の `terminate` フックは、7 時間 45 分ごとの入れ替えや再登録でも呼ばれるため、片付けには使いません。
+
+### 設定
+
+1. 3 つのワークフローをアプリ側リポジトリの `.github/workflows/` に、`examples/github-actions/scripts/*.sh` を `.github/hatch/` にコピーします。
+2. AWS に次のものを用意します（ポリシーの例は [`examples/aws/`](examples/aws/)）。
+   - プレビュー専用の ECR リポジトリ（ライフサイクルを設定）と、コード成果物用の S3 バケット
+   - イメージのビルドロール（`build-role-policy.json`、信頼ポリシーは `build-role-trust-policy.json`）
+   - GitHub Actions から OIDC で引き受ける CI 用ロール（`ci-role-policy.json`）
+3. リポジトリの変数（`vars`）とシークレットを登録します。
+
+| 名前 | 種類 | 例 |
+| :--- | :--- | :--- |
+| `AWS_REGION` | vars | `ap-northeast-1` |
+| `PREVIEW_CI_ROLE_ARN` | vars | `arn:aws:iam::123456789012:role/app-preview-ci` |
+| `PREVIEW_ECR_REPOSITORY` | vars | `app-preview` |
+| `PREVIEW_ARTIFACT_BUCKET` | vars | `app-preview-artifacts` |
+| `PREVIEW_BUILD_ROLE_ARN` | vars | `arn:aws:iam::123456789012:role/app-preview-microvm-build` |
+| `HATCH_API_BASE_URL` | vars | `https://api.preview.example.com` |
+| `PREVIEW_BASE_DOMAIN` | vars | `preview.example.com` |
+| `PREVIEW_DB_SETUP_COMMAND` | vars（任意） | `bin/rails db:prepare` |
+| `PREVIEW_EGRESS_CONNECTOR` | vars（任意） | egress の Network Connector の ARN |
+| `CI_WEBHOOK_SECRET` | secrets | hatch の `CI_WEBHOOK_SECRET` と同じ値 |
+| `PREVIEW_DATABASE_URL_BASE` | secrets | `postgres://user:pass@db.example.internal:5432`（データベース名なし） |
+
+`DATABASE_URL` は MicroVM イメージの環境変数として渡すため、イメージの設定を読める IAM の権限を持つ人には見えます。プレビュー用の DB ユーザーは、プレビュー用のデータベースだけを操作できる権限にしてください。
 
 ## Rails 側の注意点
 
