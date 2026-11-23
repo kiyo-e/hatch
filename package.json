@@ -1,8 +1,27 @@
 {
-  "name": "preview-orchestrator",
+  "name": "hatch",
   "version": "1.0.0",
   "private": true,
   "description": "Cloudflare Workers + Durable Objects reverse proxy and lifecycle orchestrator for AWS Lambda MicroVMs PR preview environments",
+  "license": "MIT",
+  "author": "kiyo-e",
+  "homepage": "https://github.com/kiyo-e/hatch#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kiyo-e/hatch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kiyo-e/hatch/issues"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "durable-objects",
+    "aws-lambda",
+    "microvm",
+    "preview-environments",
+    "hono",
+    "reverse-proxy"
+  ],
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
