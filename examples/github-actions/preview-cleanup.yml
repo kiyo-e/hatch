@@ -16,6 +16,7 @@ concurrency:
 permissions:
   id-token: write
   contents: read
+  pull-requests: read
 
 jobs:
   cleanup:
@@ -28,13 +29,30 @@ jobs:
       DB_NAME: preview_pr_${{ github.event.pull_request.number }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
+      # Concurrency does not guarantee ordering between close and a quick reopen; recheck live PR state.
+      - name: Check if PR is still closed
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          state="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+          if [ "$state" = "OPEN" ]; then
+            echo "PR #${PR_NUMBER} was reopened; skipping cleanup."
+            echo "closed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "closed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.pr.outputs.closed == 'true'
         with:
           role-to-assume: ${{ vars.PREVIEW_CI_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Destroy the preview on hatch
         id: destroy
+        if: steps.pr.outputs.closed == 'true'
         continue-on-error: true # Continue DB/ECR/S3 cleanup even if hatch destroy fails
         env:
           CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
@@ -45,6 +63,7 @@ jobs:
 
       - name: Drop the preview database
         id: drop
+        if: steps.pr.outputs.closed == 'true'
         continue-on-error: true # Continue ECR/S3 cleanup; preview-sweep.yml also cleans up DBs
         env:
           DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
@@ -55,6 +74,7 @@ jobs:
             -c "DROP DATABASE IF EXISTS \"${DB_NAME}\" WITH (FORCE)"
 
       - name: Delete the ECR tag and S3 artifacts
+        if: steps.pr.outputs.closed == 'true'
         env:
           REPOSITORY: ${{ vars.PREVIEW_ECR_REPOSITORY }}
           ARTIFACT_BUCKET: ${{ vars.PREVIEW_ARTIFACT_BUCKET }}
@@ -67,7 +87,7 @@ jobs:
           exit "$failed"
 
       - name: Fail if the destroy or the database drop did not finish
-        if: steps.destroy.outcome == 'failure' || steps.drop.outcome == 'failure'
+        if: steps.pr.outputs.closed == 'true' && (steps.destroy.outcome == 'failure' || steps.drop.outcome == 'failure')
         env:
           DESTROY: ${{ steps.destroy.outcome }}
           DROP: ${{ steps.drop.outcome }}

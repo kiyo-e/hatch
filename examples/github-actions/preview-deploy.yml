@@ -106,6 +106,7 @@ jobs:
             -d "$(jq -cn --arg image "$IMAGE_ARN" '{imageIdentifier: $image}')"
 
       - name: Prune old MicroVM image versions
+        if: ${{ !cancelled() && steps.microvm.outputs.image_arn != '' }}
         env:
           IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
         run: .github/hatch/prune-microvm-image-versions.sh

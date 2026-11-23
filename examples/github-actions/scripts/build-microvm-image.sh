@@ -48,6 +48,7 @@ else
   aws lambda-microvms create-microvm-image --name "$IMAGE_NAME" "${args[@]}" >/dev/null
   echo "creating ${IMAGE_NAME}"
 fi
+echo "image_arn=${IMAGE_ARN}" >> "$OUTPUT"
 
 # Wait up to 30 minutes for the image build to finish.
 for _ in $(seq 1 120); do
@@ -65,7 +66,4 @@ if [ "$state" != "SUCCESSFUL" ]; then
   exit 1
 fi
 echo "built ${IMAGE_NAME} ${version} (${status})"
-{
-  echo "image_arn=${IMAGE_ARN}"
-  echo "image_version=${version}"
-} >> "$OUTPUT"
+echo "image_version=${version}" >> "$OUTPUT"
