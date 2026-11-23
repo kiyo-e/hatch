@@ -52,7 +52,7 @@
 │   │   ├── preview-cleanup.yml  # PR のクローズ: 破棄と DB などの片付け
 │   │   ├── preview-sweep.yml    # 毎日: 閉じた PR の取り残しを片付ける
 │   │   └── scripts/             # MicroVM イメージの作成・更新と、古いバージョンの削除
-│   └── aws/                     # ECR のライフサイクル、CI 用ロール・ビルドロールのポリシー
+│   └── aws/                     # ECR と S3 のライフサイクル、CI 用ロール・ビルドロールのポリシーと信頼ポリシー
 ├── wrangler.jsonc
 ├── package.json
 ├── tsconfig.json
@@ -203,9 +203,10 @@ PR のクローズ時に片付けます。ただし、このジョブの失敗�
 
 1. 3 つのワークフローをアプリ側リポジトリの `.github/workflows/` に、`examples/github-actions/scripts/*.sh` を `.github/hatch/` にコピーします。
 2. AWS に次のものを用意します（ポリシーの例は [`examples/aws/`](examples/aws/)）。
-   - プレビュー専用の ECR リポジトリ（ライフサイクルを設定）と、コード成果物用の S3 バケット
+   - プレビュー専用の ECR リポジトリ（ライフサイクルは `ecr-lifecycle-policy.json`）
+   - コード成果物用の S3 バケット（ライフサイクルは `s3-lifecycle-configuration.json`。成果物はイメージのビルドが終われば不要なので、PR を閉じたときに消し損ねても 7 日で消えます）
    - イメージのビルドロール（`build-role-policy.json`、信頼ポリシーは `build-role-trust-policy.json`）
-   - GitHub Actions から OIDC で引き受ける CI 用ロール（`ci-role-policy.json`）
+   - GitHub の OIDC プロバイダー（`token.actions.githubusercontent.com`、対象者 `sts.amazonaws.com`）と、それを信頼する CI 用ロール（`ci-role-policy.json`、信頼ポリシーは `ci-role-trust-policy.json`。`sub` はアプリのリポジトリに合わせます。`pull_request` は PR のワークフロー、`ref:refs/heads/main` は既定のブランチで動く sweep 用です）
 3. リポジトリの変数（`vars`）とシークレットを登録します。
 
 | 名前 | 種類 | 例 |

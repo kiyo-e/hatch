@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-preview-artifacts",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "preview-pr-" },
+      "Expiration": { "Days": 7 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    }
+  ]
+}

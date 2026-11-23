@@ -51,6 +51,7 @@ jobs:
           all_images="$(aws lambda-microvms list-microvm-images --query 'items[].name' --output text)"
           images="$(tr '\t' '\n' <<<"$all_images" | grep -E '^preview-pr-[0-9]+$' || true)"
 
+          failed=0
           numbers="$( { sed -n 's/^preview_pr_//p' <<<"$dbs"; sed -n 's/^preview-pr-//p' <<<"$images"; } | sort -un)"
           for n in $numbers; do
             is_closed "$n" || continue
@@ -69,7 +70,14 @@ jobs:
                 && echo "  deleted MicroVM image" || echo "  ::warning::could not delete MicroVM image preview-pr-${n}"
             fi
             if grep -qx "preview_pr_${n}" <<<"$dbs"; then
-              psql "${DATABASE_URL_BASE}/postgres" -v ON_ERROR_STOP=1 \
-                -c "DROP DATABASE IF EXISTS \"preview_pr_${n}\" WITH (FORCE)" >/dev/null && echo "  dropped database"
+              if psql "${DATABASE_URL_BASE}/postgres" -v ON_ERROR_STOP=1 \
+                -c "DROP DATABASE IF EXISTS \"preview_pr_${n}\" WITH (FORCE)" >/dev/null; then
+                echo "  dropped database"
+              else
+                echo "  ::error::could not drop database preview_pr_${n}"
+                failed=1
+              fi
             fi
           done
+          # DB を消せなかったものがあれば、ほかの PR を片付けたあとでジョブを失敗にする
+          exit "$failed"
