@@ -84,7 +84,9 @@ export function envState(status: PreviewStatusResponse | undefined): EnvState {
   if (!status) return "unavailable";
   if (!status.registered) return "destroying";
   if (status.booting) return "booting";
-  if (status.microvmId) return "running";
+  // getStatus keeps the persisted microvmId past its lifetime until the next request replaces it.
+  const expired = status.expiresAt !== undefined && Date.parse(status.expiresAt) <= Date.now();
+  if (status.microvmId && !expired) return "running";
   return "idle";
 }
 

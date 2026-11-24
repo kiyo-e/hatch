@@ -32,7 +32,7 @@ function previewStub(env: Env, envId: string) {
   return env.PREVIEW_DO.get(env.PREVIEW_DO.idFromName(envId));
 }
 
-/** Registry updates only back the Admin UI list; failures must not fail CI register/destroy calls. */
+/** A failed registry removal only leaves a stale entry that the list prunes later, so it must not fail destroy. */
 async function updateRegistry(action: () => Promise<unknown>, label: string): Promise<void> {
   try {
     await action();
@@ -120,7 +120,14 @@ apiApp.post("/api/envs/:envId/register", async (c) => {
     }
     throw err;
   }
-  await updateRegistry(() => registryStub(c.env).upsert(envId, imageIdentifier), `upsert ${envId}`);
+  // GET /api/envs enumerates the registry, so a missing entry would hide a live environment from
+  // cleanup consumers. Fail the call so CI retries (re-registering the same image is safe).
+  try {
+    await registryStub(c.env).upsert(envId, imageIdentifier);
+  } catch (err) {
+    console.error(`[registry] upsert ${envId} failed:`, err);
+    return c.json({ ok: false, envId, error: "Registered, but updating the environment index failed; retry" }, 503);
+  }
   return c.json({ ok: true, envId, imageIdentifier });
 });
 

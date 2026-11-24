@@ -108,7 +108,7 @@ test("returns 401 when X-CI-Secret is missing or invalid", async () => {
 });
 
 test("list: returns registered envs with live state and excludes destroyed/destroying ones", async () => {
-  const entries = ["pr-1", "pr-2", "pr-3", "pr-4", "pr-5"].map((envId, i) => ({
+  const entries = ["pr-1", "pr-2", "pr-3", "pr-4", "pr-5", "pr-6"].map((envId, i) => ({
     envId,
     imageIdentifier: `img-${envId}`,
     registeredAt: 1_700_000_000_000 + i,
@@ -118,6 +118,7 @@ test("list: returns registered envs with live state and excludes destroyed/destr
   const statuses = {
     "pr-1": { registered: true, booting: false, microvmId: "vm-1", imageIdentifier: "img-pr-1", imageVersion: "3" },
     "pr-2": { registered: true, booting: true },
+    "pr-6": { registered: true, booting: false, microvmId: "vm-6", expiresAt: new Date(Date.now() - 1000).toISOString() },
     "pr-3": { registered: false, booting: false }, // destroyed → pruned
     "pr-4": { registered: false, booting: false, cleanupPending: { microvmIds: ["vm-4"], imageIdentifiers: [] } }, // destroying
   };
@@ -154,6 +155,7 @@ test("list: returns registered envs with live state and excludes destroyed/destr
       ["pr-1", "running"],
       ["pr-2", "booting"],
       ["pr-5", "unavailable"],
+      ["pr-6", "idle"],
     ]
   );
   assert.equal(envs[0].url, "https://pr-1.preview.example.com/");
