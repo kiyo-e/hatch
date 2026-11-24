@@ -194,6 +194,8 @@ curl -X POST "https://api.preview.example.com/api/envs/pr-123/register" \
 
 互換エイリアスとして `imageId`、任意項目として `imageVersion` も指定できます。
 
+`GET /api/envs` が使う環境の一覧を更新できなかったときは `503` を返します。そのまま再実行して構いません。
+
 ### 状態の確認
 
 ```bash

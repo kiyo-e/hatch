@@ -192,7 +192,7 @@ curl -X POST "https://api.preview.example.com/api/envs/pr-123/register" \
   -d '{"imageIdentifier":"arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-123"}'
 ```
 
-`imageId` (alias for `imageIdentifier`) and `imageVersion` (optional) are also accepted.
+`imageId` (alias for `imageIdentifier`) and `imageVersion` (optional) are also accepted. Returns `503` if the environment index used by `GET /api/envs` could not be updated; retrying is safe.
 
 ### Check Status
 
