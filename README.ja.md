@@ -160,7 +160,7 @@ curl "https://api.preview.example.com/api/envs" \
   -H "X-CI-Secret: $CI_WEBHOOK_SECRET"
 ```
 
-登録中の環境を、最新の状態とあわせて更新が新しい順に返します。破棄済み・破棄中の環境は含みません。
+登録中の環境を、hatch が記録している状態（AWS には問い合わせません）とあわせて、更新が新しい順に返します。破棄済み・破棄中の環境は含みません。
 
 ```json
 {
@@ -181,7 +181,7 @@ curl "https://api.preview.example.com/api/envs" \
 }
 ```
 
-`state` は `running`、`booting`、`idle`（登録済みで MicroVM 未起動）、`unavailable`（状態を取得できなかったもの。片付けの漏れを防ぐため一覧に残します）のいずれかです。AWS リソースの削除を再試行待ちのときは `cleanupPending` が付きます。
+`state` は `running`（MicroVM の記録があり、稼働期限内。AWS 側で先に終了していた場合は、次のアクセスで作り直します）、`booting`、`idle`（登録済みで MicroVM 未起動）、`unavailable`（状態を取得できなかったもの。片付けの漏れを防ぐため一覧に残します）のいずれかです。AWS リソースの削除を再試行待ちのときは `cleanupPending` が付きます。
 
 ### イメージの登録
 

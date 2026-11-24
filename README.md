@@ -160,7 +160,7 @@ curl "https://api.preview.example.com/api/envs" \
   -H "X-CI-Secret: $CI_WEBHOOK_SECRET"
 ```
 
-Returns registered environments with live status, most recently updated first. Destroyed and destroying environments are excluded.
+Returns registered environments with their status as recorded by hatch (no AWS calls), most recently updated first. Destroyed and destroying environments are excluded.
 
 ```json
 {
@@ -181,7 +181,7 @@ Returns registered environments with live status, most recently updated first. D
 }
 ```
 
-`state` is one of `running`, `booting`, `idle` (registered, no MicroVM yet) or `unavailable` (status could not be read; kept so cleanup jobs don't miss it). `cleanupPending` appears when AWS resources are queued for retry.
+`state` is one of `running` (a MicroVM is recorded and within its lifetime; if AWS terminated it early, the next preview request replaces it), `booting`, `idle` (registered, no MicroVM yet) or `unavailable` (status could not be read; kept so cleanup jobs don't miss it). `cleanupPending` appears when AWS resources are queued for retry.
 
 ### Register an Image
 
