@@ -1,11 +1,10 @@
 import { registerHooks } from "node:module";
 
 /**
- * src/*.ts を Node.js の型ストリッピングで直接 import するためのフック。
- * - "cloudflare:workers" は最小限のスタブに差し替える
- * - "aws4fetch" はスタブに差し替える（テストでは AWS クライアントをフェイクで注入するため、依存未インストールでも動く）。
- *   コンストラクタ引数は AwsClient.lastOptions で確認できる
- * - src 内の拡張子なし相対 import（"./aws-microvm" 等）を .ts に解決する
+ * Loader hook to import src/*.ts directly using Node.js type stripping.
+ * - Stubs "cloudflare:workers" with a minimal DurableObject base class.
+ * - Stubs "aws4fetch" (records constructor options on AwsClient.lastOptions).
+ * - Resolves extensionless relative imports inside src/ to .ts.
  */
 const STUBS = {
   "cloudflare:workers":

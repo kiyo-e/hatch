@@ -2,10 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import "./helpers/register-ts-hooks.mjs";
 
-/**
- * エッジルーター (src/index.ts) の管理 API 入力検証を、Durable Object のスタブで検証する。
- */
-
 const { default: worker } = await import("../src/index.ts");
 
 function createEnv(stubOverrides = {}) {
@@ -46,7 +42,7 @@ const api = (path, init = {}) =>
     headers: { "X-CI-Secret": "test-secret", ...(init.headers ?? {}) },
   });
 
-test("register: JSON がオブジェクトでなければ 400（例外で 500 にならない）", async () => {
+test("register: returns 400 when JSON body is not an object", async () => {
   const { env, calls } = createEnv();
   for (const body of ["null", "[]", '"str"', "1"]) {
     const res = await worker.fetch(api("/api/envs/pr-1/register", { method: "POST", body }), env);
@@ -55,7 +51,7 @@ test("register: JSON がオブジェクトでなければ 400（例外で 500 �
   assert.equal(calls.length, 0);
 });
 
-test("register: imageIdentifier / imageId を受理し、空や長すぎる値は 400", async () => {
+test("register: accepts imageIdentifier/imageId and rejects empty or oversized values with 400", async () => {
   const { env, calls } = createEnv();
   const ok = await worker.fetch(
     api("/api/envs/pr-1/register", { method: "POST", body: JSON.stringify({ imageId: "img-1", imageVersion: "2" }) }),
@@ -70,7 +66,7 @@ test("register: imageIdentifier / imageId を受理し、空や長すぎる値�
   }
 });
 
-test("envId はプレビューのサブドメインとして有効なものだけ受け付ける", async () => {
+test("accepts only valid DNS labels as envId", async () => {
   const { env } = createEnv();
   for (const envId of ["pr-1-", "-pr-1", "a".repeat(64)]) {
     const res = await worker.fetch(api(`/api/envs/${envId}/status`), env);
@@ -79,7 +75,7 @@ test("envId はプレビューのサブドメインとして有効なものだ�
   assert.equal((await worker.fetch(api(`/api/envs/${"a".repeat(63)}/status`), env)).status, 200);
 });
 
-test("destroy: クリーンアップが不完全なら 502 を返す（CI で失敗を検知できる）", async () => {
+test("destroy: returns 502 when cleanup is incomplete", async () => {
   const { env } = createEnv({
     async destroy() {
       throw new Error("Cleanup incomplete (images: img-1); it will be retried automatically.");
@@ -90,7 +86,7 @@ test("destroy: クリーンアップが不完全なら 502 を返す（CI で失
   assert.equal((await res.json()).ok, false);
 });
 
-test("register: 待機中に同じイメージが削除された場合は 409", async () => {
+test("register: returns 409 when image is deleted by an in-flight cleanup", async () => {
   const { env } = createEnv({
     async registerImage() {
       throw new Error("Image img-1 was deleted by a pending cleanup while registering; rebuild the image and register again.");
@@ -103,7 +99,7 @@ test("register: 待機中に同じイメージが削除された場合は 409", 
   assert.equal(res.status, 409);
 });
 
-test("シークレットがない・誤っている場合は 401", async () => {
+test("returns 401 when X-CI-Secret is missing or invalid", async () => {
   const { env } = createEnv();
   const noSecret = new Request("https://api.preview.example.com/api/envs/pr-1/status");
   assert.equal((await worker.fetch(noSecret, env)).status, 401);

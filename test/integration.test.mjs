@@ -2,13 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import "./helpers/register-ts-hooks.mjs";
 
-/**
- * Hono のルーター (src/index.ts) から本物の PreviewEnvironmentDO まで通して、
- * 管理 API での登録 → プレビューへのアクセス（MicroVM への転送）→ 破棄 の流れを確かめる。
- * AWS とアプリ（MicroVM のエンドポイント）はフェイクにする。
- */
-
-// Node の Request は本文がストリームのとき duplex を求める（Workers では不要）。テストでは補って再現する
+// Node's Request requires `duplex: "half"` for streamed bodies (not needed in Workers).
 const NodeRequest = globalThis.Request;
 globalThis.Request = class extends NodeRequest {
   constructor(input, init) {
@@ -96,19 +90,17 @@ const ci = (path, init = {}) =>
     headers: { "X-CI-Secret": "s3cret", "Content-Type": "application/json", ...(init.headers ?? {}) },
   });
 
-test("登録 → コールドスタート画面 → 転送 → 破棄 をルーター経由で通す", async () => {
+test("end-to-end: register -> cold start page -> proxy -> destroy", async () => {
   upstream.length = 0;
   const { env, aws, registry, settle } = createWorld();
   const image = "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-7";
 
-  // 未登録の環境は 404
   assert.equal((await worker.fetch(new Request("https://pr-7.preview.example.com/"), env)).status, 404);
 
   const reg = await worker.fetch(ci("/api/envs/pr-7/register", { method: "POST", body: JSON.stringify({ imageIdentifier: image }) }), env);
   assert.equal(reg.status, 200);
   assert.deepEqual((await registry.list()).map((e) => e.envId), ["pr-7"]);
 
-  // ブラウザのナビゲーションは、裏で起動しつつ自動リロード画面を返す
   const cold = await worker.fetch(
     new Request("https://pr-7.preview.example.com/", { headers: { Accept: "text/html", "Sec-Fetch-Mode": "navigate" } }),
     env
@@ -118,7 +110,6 @@ test("登録 → コールドスタート画面 → 転送 → 破棄 をルー�
   await settle();
   assert.deepEqual(aws.calls.map(([k]) => k), ["run"]);
 
-  // 起動後は MicroVM へ転送する（メソッド・本文・クエリ・Cookie を保ち、JWE とプロキシ用ヘッダーを付ける）
   const res = await worker.fetch(
     new Request("https://pr-7.preview.example.com/posts?page=2", {
       method: "POST",
@@ -143,12 +134,10 @@ test("登録 → コールドスタート画面 → 転送 → 破棄 をルー�
     cookie: "_session=abc",
   });
 
-  // 状態 API
   const status = await (await worker.fetch(ci("/api/envs/pr-7/status"), env)).json();
   assert.equal(status.envId, "pr-7");
   assert.equal(status.microvmId, "mvm-1");
 
-  // 破棄: MicroVM を終了しきってからイメージを削除し、台帳からも外す
   const destroyed = await worker.fetch(ci("/api/envs/pr-7/destroy", { method: "DELETE" }), env);
   assert.equal(destroyed.status, 200);
   assert.deepEqual(aws.calls.slice(-3).map(([k]) => k), ["terminate", "getState", "deleteImage"]);
@@ -156,7 +145,7 @@ test("登録 → コールドスタート画面 → 転送 → 破棄 をルー�
   assert.equal((await worker.fetch(new Request("https://pr-7.preview.example.com/"), env)).status, 404);
 });
 
-test("管理画面からの破棄も、本物の DO で MicroVM の終了とイメージの削除まで行う", async () => {
+test("Admin UI destroy terminates MicroVM, deletes image, and removes registry entry", async () => {
   const { env, aws, registry } = createWorld();
   env.API_HOSTNAME = "api.localhost";
   const image = "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-8";
@@ -168,10 +157,10 @@ test("管理画面からの破棄も、本物の DO で MicroVM の終了とイ�
     }),
     env
   );
-  await worker.fetch(new Request("https://pr-8.preview.example.com/"), env); // 起動させる
+  await worker.fetch(new Request("https://pr-8.preview.example.com/"), env);
 
   const list = await (await worker.fetch(new Request("https://api.localhost/admin"), env)).text();
-  assert.match(list, /稼働中/);
+  assert.match(list, /Running/);
 
   const res = await worker.fetch(
     new Request("https://api.localhost/admin/envs/pr-8/destroy", {
@@ -185,7 +174,7 @@ test("管理画面からの破棄も、本物の DO で MicroVM の終了とイ�
   assert.deepEqual(await registry.list(), []);
 });
 
-test("管理 API の想定外の例外は、内容を返さず JSON の 500 にする", async (t) => {
+test("Management API returns generic JSON 500 on unexpected errors", async (t) => {
   t.mock.method(console, "error", () => {});
   const { env } = createWorld();
   env.PREVIEW_DO = { idFromName: (n) => n, get: () => ({ getStatus: async () => { throw new Error("secret detail"); } }) };

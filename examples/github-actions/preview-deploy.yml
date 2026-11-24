@@ -1,31 +1,131 @@
-name: Register PR Preview Environment
+# Rebuilds and updates the preview environment on every PR open/update (example for application repositories).
+#
+#   1. Build the arm64 container image and push to ECR with a branch-based tag
+#   2. Create and seed the PR database using that image (must be idempotent)
+#   3. Create or update the per-PR MicroVM image (adds a new image version)
+#   4. Register the ARN with hatch (terminates old MicroVMs and boots the latest version on next request)
+#   5. Prune old MicroVM image versions
+#
+# Required configuration (see README "CI Integration"):
+#   vars:    AWS_REGION, PREVIEW_CI_ROLE_ARN, PREVIEW_ECR_REPOSITORY, PREVIEW_ARTIFACT_BUCKET,
+#            PREVIEW_BUILD_ROLE_ARN, HATCH_API_BASE_URL, PREVIEW_BASE_DOMAIN,
+#            PREVIEW_DB_SETUP_COMMAND (optional, default: bin/rails db:prepare), PREVIEW_EGRESS_CONNECTOR (optional)
+#   secrets: CI_WEBHOOK_SECRET, PREVIEW_DATABASE_URL_BASE (e.g. postgres://user:pass@db.example.internal:5432)
+#   files:   Copy examples/github-actions/scripts/*.sh to .github/hatch/
+name: Deploy PR Preview
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Serialize deploy and cleanup for the same PR
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # AWS OIDC authentication
+  contents: read
+  pull-requests: write # PR preview URL comment
+
 jobs:
-  register-preview:
-    runs-on: ubuntu-latest
+  deploy:
+    # Skip PRs from forks since secrets are not available
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    # MicroVMs require arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ENV_ID: pr-${{ github.event.pull_request.number }}
+      IMAGE_NAME: preview-pr-${{ github.event.pull_request.number }}
+      DB_NAME: preview_pr_${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
       - uses: actions/checkout@v4
 
-      # TODO: ここで Dockerfile + S3 zip から `aws lambda-microvms create-microvm-image` を実行し、
-      # ビルド完了したイメージ ARN を IMAGE_ARN に出力してください。
-      - name: Build MicroVM Image (placeholder)
-        id: build
-        run: |
-          echo "image_arn=arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PREVIEW_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Register image to Cloudflare Workers Orchestrator
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the app image (tag = branch name)
+        id: image
+        env:
+          REPOSITORY: ${{ steps.ecr.outputs.registry }}/${{ vars.PREVIEW_ECR_REPOSITORY }}
+        run: |
+          # Tag format: pr-<number>-<branch>. Replace characters invalid in ECR tags with '-'.
+          # Overwriting the branch tag lets the ECR lifecycle policy expire older untagged images.
+          tag="$(printf '%s-%s' "$ENV_ID" "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
+          # Keep the image locally (--load) for DB setup, and read the pushed digest from metadata-file
+          # (docker inspect RepoDigests can point to an untagged child manifest depending on the builder).
+          docker buildx build --platform linux/arm64 --provenance=false \
+            -t "${REPOSITORY}:${tag}" --push --load --metadata-file "$RUNNER_TEMP/image-meta.json" .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image-meta.json")"
+          echo "local=${REPOSITORY}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "pinned=${REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up the preview database (create + schema + seed)
+        env:
+          DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
+          SETUP_COMMAND: ${{ vars.PREVIEW_DB_SETUP_COMMAND || 'bin/rails db:prepare' }}
+          APP_IMAGE: ${{ steps.image.outputs.local }}
+        run: |
+          # The runner must be able to reach the database (use a self-hosted runner or ECS task if inside a VPC).
+          # shellcheck disable=SC2086
+          docker run --rm \
+            -e DATABASE_URL="${DATABASE_URL_BASE}/${DB_NAME}" \
+            -e RAILS_ENV=production -e SECRET_KEY_BASE_DUMMY=1 \
+            "$APP_IMAGE" $SETUP_COMMAND
+
+      - name: Build the MicroVM image
+        id: microvm
+        env:
+          CONTAINER_IMAGE: ${{ steps.image.outputs.pinned }}
+          ARTIFACT_BUCKET: ${{ vars.PREVIEW_ARTIFACT_BUCKET }}
+          BUILD_ROLE_ARN: ${{ vars.PREVIEW_BUILD_ROLE_ARN }}
+          EGRESS_CONNECTOR: ${{ vars.PREVIEW_EGRESS_CONNECTOR }}
+          DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
+        run: |
+          # Passed as MicroVM image env vars (visible to IAM principals who can describe the image).
+          ENVIRONMENT_JSON="$(jq -cn --arg url "${DATABASE_URL_BASE}/${DB_NAME}" '{DATABASE_URL: $url}')"
+          export ENVIRONMENT_JSON
+          .github/hatch/build-microvm-image.sh
+
+      - name: Register to hatch
         env:
           CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
-          API_BASE_URL: https://api.preview.example.com
-          ENV_ID: pr-${{ github.event.pull_request.number }}
-          IMAGE_ARN: ${{ steps.build.outputs.image_arn }}
+          API_BASE_URL: ${{ vars.HATCH_API_BASE_URL }}
+          IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
         run: |
-          curl --fail-with-body -sS -X POST \
-            "${API_BASE_URL}/api/envs/${ENV_ID}/register" \
+          curl --fail-with-body -sS -X POST "${API_BASE_URL}/api/envs/${ENV_ID}/register" \
             -H "Content-Type: application/json" \
             -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}" \
-            -d "{\"imageIdentifier\":\"${IMAGE_ARN}\"}"
+            -d "$(jq -cn --arg image "$IMAGE_ARN" '{imageIdentifier: $image}')"
+
+      - name: Prune old MicroVM image versions
+        if: ${{ !cancelled() && steps.microvm.outputs.image_arn != '' }}
+        env:
+          IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
+        run: .github/hatch/prune-microvm-image-versions.sh
+
+      - name: Comment the preview URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: https://${{ env.ENV_ID }}.${{ vars.PREVIEW_BASE_DOMAIN }}/
+          VERSION: ${{ steps.microvm.outputs.image_version }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          marker='<!-- hatch-preview -->'
+          body="${marker}
+          Preview: ${URL} (image ${IMAGE_NAME} ${VERSION} / ${GITHUB_SHA::7})"
+          # Update only the comment created by this workflow on subsequent runs.
+          comment_id="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" | tail -n 1)"
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body "$body"
+          fi

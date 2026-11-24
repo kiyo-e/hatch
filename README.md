@@ -182,12 +182,53 @@ Terminates the running MicroVM, deletes the image, and clears DO storage and Ala
 
 ## CI Integration (GitHub Actions)
 
-Example workflows for your application repository are provided in [`examples/github-actions/`](examples/github-actions/):
+Example workflows for your application repository are provided in [`examples/github-actions/`](examples/github-actions/). They assume an external database (PostgreSQL) where each PR gets its own isolated database.
 
-- [`preview-deploy.yml`](examples/github-actions/preview-deploy.yml): Builds and registers the MicroVM image on PR open/update.
-- [`preview-cleanup.yml`](examples/github-actions/preview-cleanup.yml): Destroys the preview environment when the PR is closed.
+| Workflow | Trigger | Purpose |
+| :--- | :--- | :--- |
+| [`preview-deploy.yml`](examples/github-actions/preview-deploy.yml) | PR open / update | Push app image to ECR → create & seed PR DB → build/update MicroVM image → register with `hatch` → prune old versions → comment preview URL on PR |
+| [`preview-cleanup.yml`](examples/github-actions/preview-cleanup.yml) | PR close | Destroy environment via `hatch` → drop PR DB → delete ECR tag & S3 build artifacts |
+| [`preview-sweep.yml`](examples/github-actions/preview-sweep.yml) | Daily / manual | Clean up leftover DBs and MicroVM images for closed PRs |
 
-Copy both into `.github/workflows/` in your application repo, set `API_BASE_URL` to your `API_HOSTNAME`, add `CI_WEBHOOK_SECRET` to repository secrets, and implement the MicroVM image build step.
+### Image Strategy
+
+- **Container images (ECR)**: Pushed with tag `pr-<number>-<branch>` (invalid characters replaced with `-`), overwriting the same tag on subsequent pushes. Untagged images are expired by the ECR lifecycle policy ([`examples/aws/ecr-lifecycle-policy.json`](examples/aws/ecr-lifecycle-policy.json)). Use a dedicated ECR repository for previews.
+- **MicroVM images**: One image per PR (`preview-pr-<number>`), adding a new version via `update-microvm-image` on each push. This keeps image count proportional to open PRs (limit: 100/region) while keeping only the latest 2 versions (limit: 50/image; the previous version is retained briefly in case a terminating MicroVM still references it).
+- Re-registering the same ARN in `hatch` terminates the old MicroVM so the next request boots the newest version.
+- MicroVMs run on `arm64`, so container images are built for `arm64`. The MicroVM Dockerfile pins the app image by digest (`FROM`) and adds a small metadata file via `COPY` (adding a layer avoids `An unknown error occurred.` on OCI-format images pushed by `docker buildx`).
+
+### Database Setup & Cleanup
+
+- `PREVIEW_DB_SETUP_COMMAND` (default: `bin/rails db:prepare`) runs against the built container image and must be idempotent. The GitHub runner must be able to reach the database (use a self-hosted runner or an ECS one-off task if the DB is in a private VPC).
+- To let MicroVMs reach a VPC database, create an egress Network Connector and set `PREVIEW_EGRESS_CONNECTOR` (at image build time) and `AWS_EGRESS_NETWORK_CONNECTORS` in `hatch` (at runtime).
+- `preview-sweep.yml` runs daily to clean up databases and MicroVM images that remain if `preview-cleanup.yml` fails or an environment is destroyed via `ZOMBIE_TTL_DAYS` / the Admin UI.
+
+### Setup
+
+1. Copy the 3 workflows into `.github/workflows/` and `examples/github-actions/scripts/*.sh` into `.github/hatch/` in your application repository.
+2. Provision the required AWS resources using the example policies in [`examples/aws/`](examples/aws/):
+   - Dedicated ECR repository (`ecr-lifecycle-policy.json`)
+   - S3 bucket for build artifacts (`s3-lifecycle-configuration.json`, expires artifacts after 7 days)
+   - MicroVM build IAM role (`build-role-policy.json`, `build-role-trust-policy.json`)
+   - GitHub OIDC provider (`token.actions.githubusercontent.com`) and CI IAM role (`ci-role-policy.json`, `ci-role-trust-policy.json` — scope `sub` to your repo for `pull_request` and `ref:refs/heads/main` for daily sweep)
+3. Configure repository variables (`vars`) and secrets:
+
+| Name | Type | Example |
+| :--- | :--- | :--- |
+| `AWS_REGION` | vars | `ap-northeast-1` |
+| `PREVIEW_CI_ROLE_ARN` | vars | `arn:aws:iam::123456789012:role/app-preview-ci` |
+| `PREVIEW_ECR_REPOSITORY` | vars | `app-preview` |
+| `PREVIEW_ARTIFACT_BUCKET` | vars | `app-preview-artifacts` |
+| `PREVIEW_BUILD_ROLE_ARN` | vars | `arn:aws:iam::123456789012:role/app-preview-microvm-build` |
+| `HATCH_API_BASE_URL` | vars | `https://api.preview.example.com` |
+| `PREVIEW_BASE_DOMAIN` | vars | `preview.example.com` |
+| `PREVIEW_DB_SETUP_COMMAND` | vars (optional) | `bin/rails db:prepare` |
+| `PREVIEW_EGRESS_CONNECTOR` | vars (optional) | ARN of your egress Network Connector |
+| `CI_WEBHOOK_SECRET` | secrets | Same value as `CI_WEBHOOK_SECRET` in `hatch` |
+| `PREVIEW_DATABASE_URL_BASE` | secrets | `postgres://user:pass@db.example.internal:5432` (without DB name) |
+
+> [!NOTE]
+> `DATABASE_URL` is passed as a MicroVM image environment variable and is visible to IAM principals with permission to describe the image. Use a dedicated DB user scoped strictly to preview databases.
 
 ## Reverse Proxy & Framework Notes
 

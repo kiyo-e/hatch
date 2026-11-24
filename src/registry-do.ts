@@ -4,10 +4,9 @@ import type { Env, RegistryEntry } from "./types";
 const KEY_PREFIX = "env:";
 
 /**
- * 登録されたプレビュー環境の台帳（管理画面の一覧用）。
- * Durable Object は名前を知らないと参照できないため、登録・破棄のたびに管理 API がここへ記録する。
- * 台帳は一覧のための索引で、環境の実際の状態は各 PreviewEnvironmentDO が持つ
- * （Alarm による自動破棄などで実体が消えた環境は、一覧の表示時に prune で取り除く）。
+ * Registry of preview environments for the Admin UI list.
+ * Serves as an index only; authoritative state lives in each PreviewEnvironmentDO
+ * (entries whose DOs were auto-destroyed by Alarms are pruned on list).
  */
 export class EnvRegistryDO extends DurableObject<Env> {
   async upsert(envId: string, imageIdentifier: string): Promise<void> {
@@ -28,8 +27,8 @@ export class EnvRegistryDO extends DurableObject<Env> {
   }
 
   /**
-   * 台帳から外す。expectedRevision を渡したときは、その番号のまま（読んだあとに登録し直されていない）場合だけ外す。
-   * 読み取りと削除の間に外部 I/O を挟まないので、同じ Durable Object への登録と交錯しない。
+   * Remove an entry. When expectedRevision is provided, only remove if the revision
+   * has not changed since the caller read it (no external I/O between get and delete).
    */
   async remove(envId: string, expectedRevision?: number): Promise<boolean> {
     const key = KEY_PREFIX + envId;

@@ -1,19 +1,96 @@
-name: Cleanup PR Preview Environment
+# Cleans up the preview environment when a PR is closed (example for application repositories).
+#   1. Destroy the environment on hatch (terminates MicroVM and deletes MicroVM image; hatch retries failures)
+#   2. Drop the PR database
+#   3. Delete the ECR branch tag and S3 build artifacts
+# Missed cleanups (job failures, zombie TTL auto-destruction, or Admin UI destroys) are caught by preview-sweep.yml.
+name: Cleanup PR Preview
 
 on:
   pull_request:
     types: [closed]
 
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: read
+
 jobs:
-  destroy-preview:
-    runs-on: ubuntu-latest
+  cleanup:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04-arm
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ENV_ID: pr-${{ github.event.pull_request.number }}
+      IMAGE_NAME: preview-pr-${{ github.event.pull_request.number }}
+      DB_NAME: preview_pr_${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
-      - name: Destroy preview MicroVM and image
+      # Concurrency does not guarantee ordering between close and a quick reopen; recheck live PR state.
+      - name: Check if PR is still closed
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          state="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+          if [ "$state" = "OPEN" ]; then
+            echo "PR #${PR_NUMBER} was reopened; skipping cleanup."
+            echo "closed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "closed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.pr.outputs.closed == 'true'
+        with:
+          role-to-assume: ${{ vars.PREVIEW_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Destroy the preview on hatch
+        id: destroy
+        if: steps.pr.outputs.closed == 'true'
+        continue-on-error: true # Continue DB/ECR/S3 cleanup even if hatch destroy fails
         env:
           CI_WEBHOOK_SECRET: ${{ secrets.CI_WEBHOOK_SECRET }}
-          API_BASE_URL: https://api.preview.example.com
-          ENV_ID: pr-${{ github.event.pull_request.number }}
+          API_BASE_URL: ${{ vars.HATCH_API_BASE_URL }}
         run: |
-          curl --fail-with-body -sS -X DELETE \
-            "${API_BASE_URL}/api/envs/${ENV_ID}/destroy" \
+          curl --fail-with-body -sS -X DELETE "${API_BASE_URL}/api/envs/${ENV_ID}/destroy" \
             -H "X-CI-Secret: ${CI_WEBHOOK_SECRET}"
+
+      - name: Drop the preview database
+        id: drop
+        if: steps.pr.outputs.closed == 'true'
+        continue-on-error: true # Continue ECR/S3 cleanup; preview-sweep.yml also cleans up DBs
+        env:
+          DATABASE_URL_BASE: ${{ secrets.PREVIEW_DATABASE_URL_BASE }}
+        run: |
+          sudo apt-get install -y -qq postgresql-client >/dev/null
+          # Terminate active connections before dropping (PostgreSQL 13+)
+          psql "${DATABASE_URL_BASE}/postgres" -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS \"${DB_NAME}\" WITH (FORCE)"
+
+      - name: Delete the ECR tag and S3 artifacts
+        if: steps.pr.outputs.closed == 'true'
+        env:
+          REPOSITORY: ${{ vars.PREVIEW_ECR_REPOSITORY }}
+          ARTIFACT_BUCKET: ${{ vars.PREVIEW_ARTIFACT_BUCKET }}
+        run: |
+          tag="$(printf '%s-%s' "$ENV_ID" "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-120)"
+          # Run both deletions even if one fails (S3 artifacts are not covered by preview-sweep.yml)
+          failed=0
+          aws ecr batch-delete-image --repository-name "$REPOSITORY" --image-ids "imageTag=${tag}" >/dev/null || failed=1
+          aws s3 rm "s3://${ARTIFACT_BUCKET}/${IMAGE_NAME}/" --recursive >/dev/null || failed=1
+          exit "$failed"
+
+      - name: Fail if the destroy or the database drop did not finish
+        if: steps.pr.outputs.closed == 'true' && (steps.destroy.outcome == 'failure' || steps.drop.outcome == 'failure')
+        env:
+          DESTROY: ${{ steps.destroy.outcome }}
+          DROP: ${{ steps.drop.outcome }}
+        run: |
+          echo "::error::Cleanup incomplete (hatch destroy: ${DESTROY} / DB drop: ${DROP}). Remaining resources will be retried by hatch and preview-sweep.yml."
+          exit 1

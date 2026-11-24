@@ -2,10 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import "./helpers/register-ts-hooks.mjs";
 
-/**
- * Cloudflare Access JWT 検証 (src/auth.ts) を、生成した RSA 鍵とフェイクの JWKS エンドポイントで検証する。
- */
-
 const { verifyPreviewAccess } = await import("../src/auth.ts");
 
 const TEAM = "team.cloudflareaccess.com";
@@ -55,7 +51,7 @@ const k1 = await makeKey("k1");
 const k2 = await makeKey("k2");
 publishedKeys = [k1];
 
-test("正当なトークンを受理する（ヘッダー / Cookie）", async () => {
+test("accepts valid Access JWT from header or cookie", async () => {
   assert.deepEqual(await verify(await sign(k1)), { ok: true });
   const cookieReq = new Request("https://pr-1.preview.example.com/", {
     headers: { Cookie: `foo=bar; CF_Authorization=${await sign(k1)}` },
@@ -63,24 +59,24 @@ test("正当なトークンを受理する（ヘッダー / Cookie）", async ()
   assert.deepEqual(await verifyPreviewAccess(cookieReq, ENV), { ok: true });
 });
 
-test("不正なトークンを拒否する", async () => {
+test("rejects invalid, expired, or forged tokens", async () => {
   assert.equal((await verify(null)).status, 401);
   assert.equal((await verify("a.b")).status, 401);
   assert.equal((await verify(await sign(k1, { exp: nowSec() - 1 }))).status, 401);
   assert.equal((await verify(await sign(k1, { aud: ["other"] }))).status, 403);
   assert.equal((await verify(await sign(k1, { iss: "https://evil.cloudflareaccess.com" }))).status, 401);
   assert.equal((await verify(await sign(k1, {}, { alg: "HS256" }))).status, 401);
-  // 別の鍵で署名して kid を偽装
+  // Sign with k2 while spoofing kid=k1
   assert.equal((await verify(await sign(k2, {}, { kid: "k1" }))).status, 401);
 });
 
-test("aud が文字列でも完全一致で比較する（部分一致で通さない）", async () => {
+test("matches string aud exactly without substring matching", async () => {
   assert.deepEqual(await verify(await sign(k1, { aud: AUD })), { ok: true });
   assert.equal((await verify(await sign(k1, { aud: `x-${AUD}-x` }))).status, 403);
 });
 
-test("鍵ローテーション直後の未知の kid は、同時リクエストも含め 1 回の JWKS 再取得で検証する", async () => {
-  await verify(await sign(k1)); // k1 だけの JWKS をキャッシュ
+test("refreshes JWKS once across concurrent requests on key rotation", async () => {
+  await verify(await sign(k1));
   publishedKeys = [k1, k2];
   const before = jwksFetches;
   const tokens = await Promise.all(Array.from({ length: 5 }, () => sign(k2)));
@@ -89,26 +85,26 @@ test("鍵ローテーション直後の未知の kid は、同時リクエスト
   assert.equal(jwksFetches, before + 1);
 });
 
-test("存在しない kid を連打しても、JWKS の再取得は一定間隔に 1 回まで", async () => {
+test("rate-limits forced JWKS refreshes for unknown kids", async () => {
   const before = jwksFetches;
   const key3 = await makeKey("unknown");
   for (let i = 0; i < 5; i++) assert.equal((await verify(await sign(key3))).status, 401);
   assert.ok(jwksFetches <= before + 1);
 });
 
-test("環境変数が両方未設定なら素通し、片方だけなら設定ミスとして拒否する", async () => {
+test("passes through when both Access vars are unset, fails closed (500) when only one is set", async () => {
   assert.deepEqual(await verify(null, {}), { ok: true });
   assert.equal((await verify("garbage", { CF_ACCESS_AUD: AUD })).status, 500);
   assert.equal((await verify("garbage", { CF_ACCESS_TEAM_DOMAIN: TEAM })).status, 500);
 });
 
-test("鍵ローテーション時の JWKS 再取得が一時的に失敗しても、次のリクエストで再取得する", async (t) => {
-  // 間隔制限はモジュール全体で共有されるため、前のテストの再取得から時間を進めておく
+test("allows retry on next request if forced JWKS refresh fails", async (t) => {
+  // Advance past the module-wide rate limit from previous tests
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 2 * 60 * 1000 });
-  await verify(await sign(k1)); // k1 だけの JWKS をキャッシュ
+  await verify(await sign(k1));
   const k0 = await makeKey("k0");
   publishedKeys = [k1, k0];
   jwksFailNext = true;
-  assert.equal((await verify(await sign(k0))).status, 401, "再取得に失敗したリクエストは 401");
-  assert.deepEqual(await verify(await sign(k0)), { ok: true }, "次のリクエストは間隔制限にかからず再取得する");
+  assert.equal((await verify(await sign(k0))).status, 401);
+  assert.deepEqual(await verify(await sign(k0)), { ok: true });
 });

@@ -3,40 +3,40 @@ import type { EnvRegistryDO } from "./registry-do";
 
 export interface Env {
   PREVIEW_DO: DurableObjectNamespace<PreviewEnvironmentDO>;
-  /** 管理画面の一覧用に、登録された環境を記録する台帳（単一インスタンス） */
+  /** Single-instance registry tracking registered environments for the Admin UI list. */
   ENV_REGISTRY: DurableObjectNamespace<EnvRegistryDO>;
   AWS_REGION: string;
   AWS_ACCESS_KEY_ID: string;
   AWS_SECRET_ACCESS_KEY: string;
-  /** 任意: 一時的な認証情報（STS）を使う場合のセッショントークン */
+  /** Optional: STS session token when using temporary AWS credentials. */
   AWS_SESSION_TOKEN?: string;
   APP_TARGET_PORT: string;
   CI_WEBHOOK_SECRET: string;
   PREVIEW_BASE_DOMAIN?: string;
   API_HOSTNAME?: string;
-  /** "true" の場合、コールドスタート中の HTML リクエストに自動リロード画面を即返す */
+  /** When "true", returns an auto-reloading HTML page to browsers during cold start. */
   COLD_START_LOADING_PAGE?: string;
-  /** 放置 PR の自動掃除までの日数（デフォルト: 14） */
+  /** Days before an idle environment is auto-destroyed by DO Alarm (default: 14). */
   ZOMBIE_TTL_DAYS?: string;
-  /** 任意: RunMicrovm に渡す IAM 実行ロール ARN */
+  /** Optional: IAM execution role ARN passed to RunMicrovm. */
   AWS_MICROVM_EXECUTION_ROLE_ARN?: string;
-  /** 任意: カンマ区切りの Egress Network Connector ARN */
+  /** Optional: comma-separated Egress Network Connector ARNs. */
   AWS_EGRESS_NETWORK_CONNECTORS?: string;
-  /** 任意: Cloudflare Access 検証を有効化する場合のチームドメイン */
+  /** Optional: Cloudflare Access team domain for JWT verification. */
   CF_ACCESS_TEAM_DOMAIN?: string;
-  /** 任意: Cloudflare Access アプリケーションの AUD タグ */
+  /** Optional: Cloudflare Access Application AUD tag for preview subdomains. */
   CF_ACCESS_AUD?: string;
-  /** 管理画面（API_HOSTNAME の /admin）を守る Cloudflare Access アプリケーションの AUD タグ */
+  /** Cloudflare Access Application AUD tag protecting /admin on API_HOSTNAME. */
   CF_ACCESS_ADMIN_AUD?: string;
 }
 
-/** 台帳に記録する環境（実際の状態は PreviewEnvironmentDO.getStatus で取得する） */
+/** Registry entry (authoritative state lives in PreviewEnvironmentDO). */
 export interface RegistryEntry {
   envId: string;
   imageIdentifier: string;
   registeredAt: number; // epoch ms
   updatedAt: number; // epoch ms
-  /** 登録のたびに増える番号（一覧の整理で、読んだあとに登録し直された環境を消さないために使う） */
+  /** Monotonically incremented per registration to guard against stale prunes. */
   revision?: number;
 }
 
@@ -53,9 +53,9 @@ export type MicroVmLifecycleState =
 export interface PersistedVmState {
   imageIdentifier: string;
   imageVersion?: string;
-  /** registerImage ごとに更新される世代 ID（起動中の再登録・破棄の検出に使用） */
+  /** Updated per registerImage call to detect concurrent re-registration or destroy during boot. */
   generation?: string;
-  /** この時刻を過ぎたら放置 PR とみなして Alarm で破棄する（epoch ms） */
+  /** Timestamp after which an idle environment is eligible for Alarm cleanup (epoch ms). */
   zombieAt?: number;
   microvmId?: string;
   endpointUrl?: string;
@@ -80,17 +80,17 @@ export interface CachedJweToken {
   expiresAt: number; // epoch ms
 }
 
-/** destroy で終了・削除に失敗し、Alarm で再試行する対象 */
+/** Resources that failed to terminate/delete during destroy and are queued for Alarm retry. */
 export interface PendingCleanup {
   microvmIds: string[];
   imageIdentifiers: string[];
   retryAt: number; // epoch ms
-  /** 破棄の途中で状態の削除が終わっていない（有効な登録として扱わず、Alarm で状態の削除から再試行する） */
+  /** True if destroy failed before clearing state; Alarm retries full state deletion. */
   destroyState?: boolean;
 }
 
 export interface RegisterImagePayload {
-  /** MicroVM イメージの ARN または ID（互換性のため imageId も受理） */
+  /** MicroVM image ARN or ID (`imageId` is accepted as a compatibility alias). */
   imageIdentifier?: string;
   imageId?: string;
   imageVersion?: string;
@@ -105,7 +105,7 @@ export interface PreviewStatusResponse {
   createdAt?: string;
   expiresAt?: string;
   alarmAt?: string;
-  /** destroy で削除しきれず、Alarm で再試行待ちのリソース */
+  /** Resources pending cleanup retry via DO Alarm. */
   cleanupPending?: {
     microvmIds: string[];
     imageIdentifiers: string[];

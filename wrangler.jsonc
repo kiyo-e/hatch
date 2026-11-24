@@ -5,13 +5,13 @@
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  // console.error で残しているログ（起動失敗・削除の失敗など）を Workers Logs で見られるようにする
+  // Enable Workers Logs for error visibility (e.g. boot or cleanup failures)
   "observability": {
     "enabled": true
   },
 
-  // ホスト名（API_HOSTNAME と *.PREVIEW_BASE_DOMAIN）で振り分けるため、workers.dev とプレビュー URL では動かない。
-  // カスタムドメインの routes で公開する（ドメインは vars に合わせて書き換える）
+  // Routing relies on hostnames (API_HOSTNAME and *.PREVIEW_BASE_DOMAIN), so workers.dev and preview URLs are disabled.
+  // Uncomment and update `routes` for your custom domain.
   "workers_dev": false,
   "preview_urls": false,
   // "routes": [
@@ -21,19 +21,19 @@
 
   "durable_objects": {
     "bindings": [
-      // 1 プレビュー環境 = 1 インスタンス（envId で idFromName）
+      // 1 preview environment = 1 Durable Object instance (idFromName by envId)
       {
         "name": "PREVIEW_DO",
         "class_name": "PreviewEnvironmentDO"
       },
-      // 管理画面の一覧用の台帳（単一インスタンス）
+      // Single-instance registry for Admin UI listing
       {
         "name": "ENV_REGISTRY",
         "class_name": "EnvRegistryDO"
       }
     ]
   },
-  // 適用済みのタグは書き換えない。クラスを足すときは新しいタグを追加する
+  // Never edit applied migration tags; append a new tag when adding new classes.
   "migrations": [
     {
       "tag": "v1",
@@ -46,32 +46,32 @@
   ],
 
   "vars": {
-    // MicroVM を動かすリージョンと、MicroVM 内のアプリの待受ポート
+    // AWS region for MicroVMs and listening port inside the MicroVM
     "AWS_REGION": "ap-northeast-1",
     "APP_TARGET_PORT": "8080",
-    // プレビューは <envId>.PREVIEW_BASE_DOMAIN、CI 用の管理 API と管理画面 (/admin) は API_HOSTNAME
+    // Previews use <envId>.PREVIEW_BASE_DOMAIN; Management API and Admin UI (/admin) use API_HOSTNAME
     "PREVIEW_BASE_DOMAIN": "preview.example.com",
     "API_HOSTNAME": "api.preview.example.com",
-    // 起動中のブラウザのアクセスに、3 秒ごとに再読み込みする画面を返す
+    // Return a 3s auto-reloading HTML page to browsers while a MicroVM is booting
     "COLD_START_LOADING_PAGE": "true",
-    // PR クローズの Webhook を取りこぼしても、この日数で環境を自動破棄する
+    // Auto-destroy idle environments via DO Alarm after this many days
     "ZOMBIE_TTL_DAYS": "14"
-    // 任意:
+    // Optional:
     // "AWS_MICROVM_EXECUTION_ROLE_ARN": "arn:aws:iam::123456789012:role/preview-microvm",
     // "AWS_EGRESS_NETWORK_CONNECTORS": "arn:aws:lambda:ap-northeast-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
   },
 
-  // シークレット（`wrangler secret put <NAME>` で登録。ローカルでは .dev.vars）:
+  // Secrets (`wrangler secret put <NAME>` in production, `.dev.vars` locally):
   // - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-  // - AWS_SESSION_TOKEN     （任意: 一時的な認証情報を使う場合）
-  // - CI_WEBHOOK_SECRET     （管理 API の X-CI-Secret）
-  // - CF_ACCESS_TEAM_DOMAIN （Cloudflare Access のチームドメイン。プレビュー・管理画面で共通）
-  // - CF_ACCESS_AUD         （任意: プレビューを Access で守る場合の AUD）
-  // - CF_ACCESS_ADMIN_AUD   （管理画面を使う場合の、管理画面用 Access アプリの AUD）
+  // - AWS_SESSION_TOKEN     (optional: for temporary STS credentials)
+  // - CI_WEBHOOK_SECRET     (shared secret for Management API X-CI-Secret)
+  // - CF_ACCESS_TEAM_DOMAIN (Cloudflare Access team domain, shared by previews and Admin UI)
+  // - CF_ACCESS_AUD         (optional: Access Application AUD for preview subdomains)
+  // - CF_ACCESS_ADMIN_AUD   (required for Admin UI: Access Application AUD for /admin)
 
   "dev": {
-    // wrangler dev は Origin / Referer を内部の URL に書き換える。https にしておかないと、
-    // Rails などの CSRF 検証や ActionCable の Origin チェックが手元で失敗する（本番では起きない）
+    // Keep upstream_protocol as https so wrangler dev does not rewrite Origin/Referer to http://,
+    // which would break CSRF Origin checks and ActionCable locally.
     "upstream_protocol": "https"
   }
 }

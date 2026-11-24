@@ -16,15 +16,15 @@ export function registryStub(env: Env) {
 
 interface EnvRow {
   entry: RegistryEntry;
-  /** 状態を取得できなかった環境は undefined（一覧からは外さず、取得できないことを表示する） */
+  /** Undefined when getStatus failed; kept in the list as unavailable. */
   status?: PreviewStatusResponse;
 }
 
 /**
- * 台帳の環境ごとに実際の状態を取得する。
- * - 1 つの環境で状態の取得に失敗しても、一覧全体は表示する
- * - 登録も削除待ちも無い環境（Alarm で自動破棄された等）は台帳から外す。ただし状態を読んだあとに
- *   登録し直された環境は消さない（台帳の revision が読んだときのままの場合だけ外す）
+ * Fetch live status for every registered environment.
+ * - Individual getStatus failures do not break the whole list.
+ * - Environments with neither registration nor pending cleanup are pruned from the registry,
+ *   guarded by revision so a concurrent re-registration is never removed.
  */
 async function loadEnvs(env: Env): Promise<EnvRow[]> {
   const registry = registryStub(env);
@@ -34,7 +34,6 @@ async function loadEnvs(env: Env): Promise<EnvRow[]> {
       const status = await env.PREVIEW_DO.get(env.PREVIEW_DO.idFromName(entry.envId)).getStatus();
       if (!status.registered && !status.cleanupPending) {
         const removed = await registry.remove(entry.envId, entry.revision ?? 0);
-        // 読んだあとに登録し直されていれば残す（状態は次に一覧を開いたときに表示する）
         return removed ? null : { entry };
       }
       return { entry, status };
@@ -54,13 +53,12 @@ export function previewUrl(
 ): string {
   const url = new URL(requestUrl);
   const base = env.PREVIEW_BASE_DOMAIN || "preview.example.com";
-  // 本番のプレビューは常に https。wrangler dev（*.localhost）は http で開くが、upstream_protocol: https により
-  // Worker から見た URL は https になるため、リクエストのスキームではなくホスト名で決める
+  // Production previews are always https; local wrangler dev (*.localhost) uses http in the browser
+  // even though upstream_protocol: https makes the Worker see https.
   const local = url.hostname === "localhost" || url.hostname.endsWith(".localhost");
   return `${local ? "http" : "https"}://${envId}.${base}${local && url.port ? `:${url.port}` : ""}/`;
 }
 
-/** 値が無いときの表示（どの欄でも同じ見た目にする） */
 const EMPTY = html`<span class="empty-value">-</span>`;
 
 function formatTime(value?: string | number): Markup | string {
@@ -68,30 +66,29 @@ function formatTime(value?: string | number): Markup | string {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? EMPTY
-    : date.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", hour12: false });
+    : `${date.toISOString().replace("T", " ").slice(0, 19)} UTC`;
 }
 
 function codeOrEmpty(value?: string): Markup {
   return value ? html`<code>${value}</code>` : EMPTY;
 }
 
-/** ARN の末尾（イメージ名）だけを表示する */
 function shortImage(identifier?: string): Markup {
   if (!identifier) return EMPTY;
   return html`<code title="${identifier}">${identifier.split(":").pop() ?? identifier}</code>`;
 }
 
 function stateBadge(status: PreviewStatusResponse | undefined): Markup {
-  if (!status) return html`<span class="badge">状態を取得できません</span>`;
-  if (!status.registered) return html`<span class="badge warn">破棄中</span>`;
-  if (status.booting) return html`<span class="badge info">起動中</span>`;
-  if (status.microvmId) return html`<span class="badge ok">稼働中</span>`;
-  return html`<span class="badge">待機</span>`;
+  if (!status) return html`<span class="badge">Unavailable</span>`;
+  if (!status.registered) return html`<span class="badge warn">Destroying</span>`;
+  if (status.booting) return html`<span class="badge info">Booting</span>`;
+  if (status.microvmId) return html`<span class="badge ok">Running</span>`;
+  return html`<span class="badge">Idle</span>`;
 }
 
 function layout(title: string, body: Markup, notice?: string): Markup {
   return html`<!doctype html>
-<html lang="ja">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -110,7 +107,7 @@ function layout(title: string, body: Markup, notice?: string): Markup {
       }
       * { box-sizing: border-box; }
       body { margin: 0; background: var(--bg); color: var(--fg);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif; }
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
       header { border-bottom: 1px solid var(--line); background: var(--card); }
       header .inner { max-width: 1100px; margin: 0 auto; padding: 14px 16px; display: flex; gap: 12px; align-items: baseline; }
       header a { color: inherit; text-decoration: none; font-weight: 700; }
@@ -135,7 +132,6 @@ function layout(title: string, body: Markup, notice?: string): Markup {
       dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
       button.danger { background: var(--danger); color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font-size: 0.9rem; cursor: pointer; }
       .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-      /* 狭い画面: 一覧は補助的な列を隠し、詳細はラベルと値を縦に並べる（上の指定より後ろに置く） */
       @media (max-width: 640px) {
         .wide-only { display: none; }
         th, td { padding: 10px 8px; }
@@ -146,7 +142,7 @@ function layout(title: string, body: Markup, notice?: string): Markup {
     </style>
   </head>
   <body>
-    <header><div class="inner"><a href="/admin">hatch</a><span>プレビュー環境の管理</span></div></header>
+    <header><div class="inner"><a href="/admin">hatch</a><span>Preview Environment Manager</span></div></header>
     <main>
       ${notice ? html`<p class="notice" role="status">${notice}</p>` : ""}
       ${body}
@@ -156,13 +152,13 @@ function layout(title: string, body: Markup, notice?: string): Markup {
 }
 
 function listPage(rows: EnvRow[], requestUrl: string, env: Env, notice?: string): Markup {
-  const body = html`<h1>環境の一覧（${rows.length}）</h1>
+  const body = html`<h1>Environments (${rows.length})</h1>
     <div class="table-wrap">
       ${rows.length === 0
-        ? html`<p class="empty">登録された環境はありません。</p>`
+        ? html`<p class="empty">No registered environments.</p>`
         : html`<table>
             <thead>
-              <tr><th>環境</th><th>状態</th><th class="wide-only">イメージ</th><th>MicroVM の期限</th><th class="wide-only">最終登録</th><th>削除待ち</th><th></th></tr>
+              <tr><th>Environment</th><th>Status</th><th class="wide-only">Image</th><th>MicroVM Expires</th><th class="wide-only">Last Registered</th><th>Pending Cleanup</th><th></th></tr>
             </thead>
             <tbody>
               ${rows.map(({ entry, status }) => {
@@ -174,14 +170,14 @@ function listPage(rows: EnvRow[], requestUrl: string, env: Env, notice?: string)
                   <td class="wide-only">${shortImage(status?.imageIdentifier ?? entry.imageIdentifier)}</td>
                   <td>${formatTime(status?.expiresAt)}</td>
                   <td class="wide-only">${formatTime(entry.updatedAt)}</td>
-                  <td>${pendingCount > 0 ? html`<span class="badge warn">${pendingCount} 件</span>` : EMPTY}</td>
-                  <td>${status?.registered ? html`<a href="${previewUrl(requestUrl, entry.envId, env)}" target="_blank" rel="noopener">開く</a>` : ""}</td>
+                  <td>${pendingCount > 0 ? html`<span class="badge warn">${pendingCount}</span>` : EMPTY}</td>
+                  <td>${status?.registered ? html`<a href="${previewUrl(requestUrl, entry.envId, env)}" target="_blank" rel="noopener">Open</a>` : ""}</td>
                 </tr>`;
               })}
             </tbody>
           </table>`}
     </div>`;
-  return layout("hatch 管理", body, notice);
+  return layout("hatch Admin", body, notice);
 }
 
 function detailPage(
@@ -192,36 +188,35 @@ function detailPage(
   env: Env
 ): Markup {
   const pending = status.cleanupPending;
-  // 破棄の途中は登録が消えているので、台帳に残っている最後のイメージを表示する
   const image = status.imageIdentifier ?? entry?.imageIdentifier;
   const body = html`<h1>${envId}</h1>
     <dl>
-      <dt>状態</dt><dd>${stateBadge(status)}</dd>
-      <dt>プレビュー</dt><dd>${status.registered
+      <dt>Status</dt><dd>${stateBadge(status)}</dd>
+      <dt>Preview</dt><dd>${status.registered
         ? html`<a href="${previewUrl(requestUrl, envId, env)}" target="_blank" rel="noopener">${previewUrl(requestUrl, envId, env)}</a>`
         : EMPTY}</dd>
-      <dt>イメージ</dt><dd>${codeOrEmpty(image)}${!status.registered && image ? html` <span class="muted">（破棄前に登録されていたイメージ）</span>` : ""}</dd>
-      <dt>イメージのバージョン</dt><dd>${status.registered ? (status.imageVersion ?? "最新") : EMPTY}</dd>
+      <dt>Image</dt><dd>${codeOrEmpty(image)}${!status.registered && image ? html` <span class="muted">(last registered before destroy)</span>` : ""}</dd>
+      <dt>Image Version</dt><dd>${status.registered ? (status.imageVersion ?? "latest") : EMPTY}</dd>
       <dt>MicroVM</dt><dd>${codeOrEmpty(status.microvmId)}</dd>
-      <dt>MicroVM の起動</dt><dd>${formatTime(status.createdAt)}</dd>
-      <dt>MicroVM の期限</dt><dd>${formatTime(status.expiresAt)}</dd>
-      <dt>次の Alarm</dt><dd>${formatTime(status.alarmAt)}</dd>
-      <dt>削除待ち</dt><dd>${pending
-        ? html`MicroVM: ${codeOrEmpty(pending.microvmIds.join(", "))}<br />イメージ: ${codeOrEmpty(pending.imageIdentifiers.join(", "))}
-            <div class="muted">削除できなかったリソースは、次の Alarm で自動的に再試行します</div>`
+      <dt>MicroVM Started</dt><dd>${formatTime(status.createdAt)}</dd>
+      <dt>MicroVM Expires</dt><dd>${formatTime(status.expiresAt)}</dd>
+      <dt>Next Alarm</dt><dd>${formatTime(status.alarmAt)}</dd>
+      <dt>Pending Cleanup</dt><dd>${pending
+        ? html`MicroVM: ${codeOrEmpty(pending.microvmIds.join(", "))}<br />Image: ${codeOrEmpty(pending.imageIdentifiers.join(", "))}
+            <div class="muted">Failed deletions are retried automatically on the next Alarm.</div>`
         : EMPTY}</dd>
     </dl>
     <div class="actions">
       <form method="post" action="/admin/envs/${envId}/destroy"
-        onsubmit="return confirm('${raw(envId)} を破棄します。MicroVM を終了し、イメージを削除します。よろしいですか？')">
-        <button type="submit" class="danger">${status.registered ? "破棄する" : "破棄を再試行する"}</button>
+        onsubmit="return confirm('Destroy ${raw(envId)}? This will terminate the MicroVM and delete its image.')">
+        <button type="submit" class="danger">${status.registered ? "Destroy" : "Retry Destroy"}</button>
       </form>
-      <a href="/admin">一覧に戻る</a>
+      <a href="/admin">Back to list</a>
     </div>`;
-  return layout(`${envId} - hatch 管理`, body);
+  return layout(`${envId} - hatch Admin`, body);
 }
 
-/** 管理画面（API_HOSTNAME の /admin 以下にマウントする） */
+/** Admin UI mounted under /admin on API_HOSTNAME. */
 export const adminApp = new Hono<AppEnv>();
 
 adminApp.use("*", async (c, next) => {
@@ -231,7 +226,6 @@ adminApp.use("*", async (c, next) => {
   c.header("X-Frame-Options", "DENY");
   await next();
 });
-// 破棄フォームの POST は同じオリジンからのものだけ受け付ける
 adminApp.use("*", csrf());
 
 adminApp.get("/", async (c) => {
@@ -244,7 +238,7 @@ adminApp.get("/envs/:envId", async (c) => {
   if (!ENV_ID_REGEX.test(envId)) return c.notFound();
   const status = await c.env.PREVIEW_DO.get(c.env.PREVIEW_DO.idFromName(envId)).getStatus();
   if (!status.registered && !status.cleanupPending) {
-    return c.redirect(`/admin?notice=${encodeURIComponent(`${envId} は登録されていません`)}`, 303);
+    return c.redirect(`/admin?notice=${encodeURIComponent(`${envId} is not registered`)}`, 303);
   }
   const entry = await registryStub(c.env).get(envId);
   return c.html(detailPage(envId, status, entry, c.req.url, c.env));
@@ -258,22 +252,21 @@ adminApp.post("/envs/:envId/destroy", async (c) => {
   try {
     await c.env.PREVIEW_DO.get(c.env.PREVIEW_DO.idFromName(envId)).destroy();
   } catch (err) {
-    // 「自動で再試行される」と言えるのは、削除しきれなかった分が削除待ちとして記録された場合
-    // （CleanupIncompleteError）だけ。RPC やストレージの失敗では何も記録されていないことがある
+    // Only CleanupIncompleteError guarantees failed resources were persisted for Alarm retry.
     const message = (err as Error)?.message ?? "";
     console.error(`[admin] destroy ${envId} failed:`, err);
     return back(
       message.startsWith("Cleanup incomplete")
-        ? `${envId} の破棄は一部が未完了です。残りは自動で再試行されます`
-        : `${envId} の破棄に失敗しました。自動では再試行されないため、もう一度破棄してください`
+        ? `${envId} destroy is partially incomplete; remaining resources will be retried automatically`
+        : `Failed to destroy ${envId}. Automatic retry is not scheduled; please try again`
     );
   }
 
   try {
     await registryStub(c.env).remove(envId);
   } catch (err) {
-    // 環境は破棄済み。台帳に残っていても、次に一覧を開いたときに外れる
+    // Environment is already destroyed; stale registry entry will be pruned on next list view.
     console.error(`[admin] registry remove ${envId} failed:`, err);
   }
-  return back(`${envId} を破棄しました`);
+  return back(`Destroyed ${envId}`);
 });

@@ -1,21 +1,21 @@
-# ローカル開発用（`cp .dev.vars.example .dev.vars` して `npm run dev`）。
-# wrangler dev が自動で読み込み、wrangler.jsonc の vars より優先される。
-# 本番では `wrangler secret put <NAME>` を使う。
+# Local development (`cp .dev.vars.example .dev.vars && npm run dev`).
+# Loaded automatically by `wrangler dev` and overrides `vars` in wrangler.jsonc.
+# For production, use `wrangler secret put <NAME>`.
 
-# ローカルのホスト名: 管理 API と管理画面は http://api.localhost:8787、プレビューは http://<envId>.localhost:8787
+# Local hostnames: Management API & Admin UI at http://api.localhost:8787, previews at http://<envId>.localhost:8787
 API_HOSTNAME=api.localhost
 PREVIEW_BASE_DOMAIN=localhost
 
-# AWS の認証情報（ダミーのままでも、登録・一覧・管理画面は試せる。MicroVM の起動には本物が必要）
+# AWS credentials (dummy values work for testing registration, listing, and Admin UI; real credentials are required to boot MicroVMs)
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-# 任意: 一時的な認証情報（`aws configure export-credentials` など）を使う場合
+# Optional: temporary STS credentials (e.g., from `aws configure export-credentials`)
 # AWS_SESSION_TOKEN=
 
-# 管理 API の X-CI-Secret
+# Shared secret for Management API X-CI-Secret header
 CI_WEBHOOK_SECRET=replace-with-random-secret
 
-# 任意: Cloudflare Access の JWT 検証（*.localhost の管理画面は、未設定なら認証なしで開ける）
+# Optional: Cloudflare Access JWT verification (Admin UI on *.localhost bypasses Access when unset)
 # CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
 # CF_ACCESS_AUD=your-preview-application-audience-tag
 # CF_ACCESS_ADMIN_AUD=your-admin-application-audience-tag

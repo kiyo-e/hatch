@@ -41,9 +41,7 @@ export interface MicroVmClient {
 }
 
 /**
- * RunMicrovm の `endpoint` を URL に正規化する。
- * 公式ドキュメントは「HTTPS endpoint URL」と説明する一方、例示はスキームなしのホスト名
- * （例: abc123def456.lambda-microvm.us-east-1.on.aws）のため、どちらの形式でも扱えるようにする。
+ * Normalize RunMicrovm `endpoint` to a URL (AWS docs describe an HTTPS URL, while examples show bare hostnames).
  */
 export function normalizeEndpointUrl(endpoint: string): string {
   const trimmed = endpoint.trim();
@@ -51,8 +49,7 @@ export function normalizeEndpointUrl(endpoint: string): string {
 }
 
 /**
- * AWS Lambda MicroVMs API (/2025-09-09/) の SigV4 クライアントラッパー。
- * Cloudflare Workers バンドルサイズを抑えるため aws4fetch を使用。
+ * SigV4 client for AWS Lambda MicroVMs API (/2025-09-09/) backed by aws4fetch.
  */
 export class AwsMicroVmClient implements MicroVmClient {
   private readonly signer: AwsClient;
@@ -64,7 +61,6 @@ export class AwsMicroVmClient implements MicroVmClient {
     this.signer = new AwsClient({
       accessKeyId: env.AWS_ACCESS_KEY_ID,
       secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      // 一時的な認証情報（STS / aws configure export-credentials）を使う場合のみ設定
       sessionToken: env.AWS_SESSION_TOKEN || undefined,
       region: env.AWS_REGION,
       service: "lambda",
@@ -74,7 +70,6 @@ export class AwsMicroVmClient implements MicroVmClient {
 
   /**
    * POST /2025-09-09/microvms (RunMicrovm)
-   * スナップショットイメージから新しい MicroVM を起動する。
    */
   async runMicroVm(params: RunMicroVmParams): Promise<RunMicroVmResult> {
     const body: Record<string, unknown> = {
@@ -129,8 +124,6 @@ export class AwsMicroVmClient implements MicroVmClient {
 
   /**
    * POST /2025-09-09/microvms/{microvmIdentifier}/auth-token (CreateMicrovmAuthToken)
-   * エンドポイント接続用の短命 JWE 認証トークンを発行する。
-   * レスポンスの authToken["X-aws-proxy-auth"] をプロキシ時のヘッダーに付与する。
    */
   async createMicroVmAuthToken(params: CreateAuthTokenParams): Promise<CreateAuthTokenResult> {
     const expirationInMinutes = Math.min(60, Math.max(1, Math.floor(params.expirationInMinutes)));
@@ -180,7 +173,6 @@ export class AwsMicroVmClient implements MicroVmClient {
 
   /**
    * DELETE /2025-09-09/microvms/{microvmIdentifier} (TerminateMicrovm)
-   * べき等操作（既に終了済みでも 200 OK）。
    */
   async terminateMicroVm(microvmId: string): Promise<void> {
     const res = await this.signer.fetch(
@@ -194,7 +186,6 @@ export class AwsMicroVmClient implements MicroVmClient {
 
   /**
    * DELETE /2025-09-09/microvm-images/{imageIdentifier} (DeleteMicrovmImage)
-   * べき等操作（既に削除済みでも 200 OK）。
    */
   async deleteMicroVmImage(imageIdentifier: string): Promise<void> {
     const res = await this.signer.fetch(
