@@ -113,12 +113,16 @@ test("Management API: adds to registry on register, removes on destroy, keeps on
   assert.deepEqual((await ng.registry.list()).map((e) => e.envId), ["pr-2"]);
 });
 
-test("Management API: register succeeds even if registry update fails", async (t) => {
+test("Management API: register returns 503 when the registry update fails so CI retries", async (t) => {
   t.mock.method(console, "error", () => {});
   const { env, calls } = createEnv();
   env.ENV_REGISTRY = { idFromName: () => "x", get: () => ({ upsert: async () => { throw new Error("registry down"); } }) };
-  await register(env, "pr-1");
-  assert.deepEqual(calls, [["register", "pr-1", "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-1"]]);
+  const res = await worker.fetch(
+    ci("api.localhost", "/api/envs/pr-1/register", { method: "POST", body: JSON.stringify({ imageIdentifier: "img-1" }) }),
+    env
+  );
+  assert.equal(res.status, 503);
+  assert.deepEqual(calls, [["register", "pr-1", "img-1"]]);
 });
 
 test("Management API: returns 405 for wrong method and 404 for unknown paths after auth", async () => {
@@ -168,7 +172,7 @@ test("Admin UI: lists registered environments with live status and prunes missin
     imageIdentifier: "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-1",
     microvmId: "microvm-abc",
     booting: false,
-    expiresAt: "2026-11-23T07:45:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
   };
   statuses["pr-2"] = { registered: false, booting: false };
 

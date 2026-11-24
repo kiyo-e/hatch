@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { adminApp, ENV_ID_REGEX, registryStub } from "./admin";
+import { adminApp, ENV_ID_REGEX, envState, loadEnvs, previewUrl, registryStub } from "./admin";
 import { verifyCiSecret, verifyPreviewAccess } from "./auth";
 import { PreviewEnvironmentDO } from "./preview-do";
 import { EnvRegistryDO } from "./registry-do";
@@ -32,7 +32,7 @@ function previewStub(env: Env, envId: string) {
   return env.PREVIEW_DO.get(env.PREVIEW_DO.idFromName(envId));
 }
 
-/** Registry updates only back the Admin UI list; failures must not fail CI register/destroy calls. */
+/** A failed registry removal only leaves a stale entry that the list prunes later, so it must not fail destroy. */
 async function updateRegistry(action: () => Promise<unknown>, label: string): Promise<void> {
   try {
     await action();
@@ -55,6 +55,37 @@ apiApp.use("*", async (c, next) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
   await next();
+});
+
+const iso = (ms?: number) => (ms === undefined ? undefined : new Date(ms).toISOString());
+
+/**
+ * List registered environments with live status (destroyed / destroying ones are excluded).
+ * Environments whose status could not be read are kept with state "unavailable"
+ * so callers such as cleanup jobs don't silently miss them.
+ */
+apiApp.get("/api/envs", async (c) => {
+  const rows = await loadEnvs(c.env);
+  const envs = rows.flatMap(({ entry, status }) => {
+    const state = envState(status);
+    if (state === "destroying") return [];
+    return [
+      {
+        envId: entry.envId,
+        state,
+        url: previewUrl(c.req.url, entry.envId, c.env),
+        imageIdentifier: status?.imageIdentifier ?? entry.imageIdentifier,
+        imageVersion: status?.imageVersion,
+        microvmId: status?.microvmId,
+        registeredAt: iso(entry.registeredAt),
+        updatedAt: iso(entry.updatedAt),
+        createdAt: status?.createdAt,
+        expiresAt: status?.expiresAt,
+        cleanupPending: status?.cleanupPending,
+      },
+    ];
+  });
+  return c.json({ envs });
 });
 
 apiApp.use("/api/envs/:envId/:action", async (c, next) => {
@@ -89,7 +120,14 @@ apiApp.post("/api/envs/:envId/register", async (c) => {
     }
     throw err;
   }
-  await updateRegistry(() => registryStub(c.env).upsert(envId, imageIdentifier), `upsert ${envId}`);
+  // GET /api/envs enumerates the registry, so a missing entry would hide a live environment from
+  // cleanup consumers. Fail the call so CI retries (re-registering the same image is safe).
+  try {
+    await registryStub(c.env).upsert(envId, imageIdentifier);
+  } catch (err) {
+    console.error(`[registry] upsert ${envId} failed:`, err);
+    return c.json({ ok: false, envId, error: "Registered, but updating the environment index failed; retry" }, 503);
+  }
   return c.json({ ok: true, envId, imageIdentifier });
 });
 

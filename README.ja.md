@@ -48,7 +48,7 @@ npm run dev
 `.dev.vars` により `API_HOSTNAME=api.localhost` / `PREVIEW_BASE_DOMAIN=localhost` が有効になり、`wrangler.jsonc` の設定より優先されます。
 
 - **管理画面**: `http://api.localhost:8787/admin`（`localhost` では Access 認証をバイパスします）
-- **管理 API**: `http://api.localhost:8787/api/envs/:envId/*`
+- **管理 API**: `http://api.localhost:8787/api/envs` と `/api/envs/:envId/*`
 - **プレビュー URL**: `http://<envId>.localhost:8787`
 
 `.dev.vars.example` のダミー AWS 認証情報のままでも、イメージ登録・一覧・管理画面の動作を確認できます（MicroVM の実起動には本物の AWS 認証情報が必要です）。
@@ -151,7 +151,37 @@ npm run deploy
 
 ## 管理 API
 
-`/api/envs/:envId/*` はすべて `X-CI-Secret` ヘッダーが必須です。`:envId` は有効な DNS ラベル（英小文字・数字・ハイフン、63 文字以内）のみ受け付けます。
+`/api/envs` 以下はすべて `X-CI-Secret` ヘッダーが必須です。`:envId` は有効な DNS ラベル（英小文字・数字・ハイフン、63 文字以内）のみ受け付けます。
+
+### 環境の一覧
+
+```bash
+curl "https://api.preview.example.com/api/envs" \
+  -H "X-CI-Secret: $CI_WEBHOOK_SECRET"
+```
+
+登録中の環境を、hatch が記録している状態（AWS には問い合わせません）とあわせて、更新が新しい順に返します。破棄済み・破棄中の環境は含みません。
+
+```json
+{
+  "envs": [
+    {
+      "envId": "pr-123",
+      "state": "running",
+      "url": "https://pr-123.preview.example.com/",
+      "imageIdentifier": "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-123",
+      "imageVersion": "3",
+      "microvmId": "...",
+      "registeredAt": "2026-11-20T01:23:45.000Z",
+      "updatedAt": "2026-11-24T05:00:00.000Z",
+      "createdAt": "2026-11-24T05:01:10.000Z",
+      "expiresAt": "2026-11-24T12:46:10.000Z"
+    }
+  ]
+}
+```
+
+`state` は `running`（MicroVM の記録があり、稼働期限内。AWS 側で先に終了していた場合は、次のアクセスで作り直します）、`booting`、`idle`（登録済みで MicroVM 未起動）、`unavailable`（状態を取得できなかったもの。片付けの漏れを防ぐため一覧に残します）のいずれかです。AWS リソースの削除を再試行待ちのときは `cleanupPending` が付きます。
 
 ### イメージの登録
 
@@ -163,6 +193,8 @@ curl -X POST "https://api.preview.example.com/api/envs/pr-123/register" \
 ```
 
 互換エイリアスとして `imageId`、任意項目として `imageVersion` も指定できます。
+
+`GET /api/envs` が使う環境の一覧を更新できなかったときは `503` を返します。そのまま再実行して構いません。
 
 ### 状態の確認
 

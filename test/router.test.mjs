@@ -106,3 +106,68 @@ test("returns 401 when X-CI-Secret is missing or invalid", async () => {
   const wrong = api("/api/envs/pr-1/status", { headers: { "X-CI-Secret": "wrong" } });
   assert.equal((await worker.fetch(wrong, env)).status, 401);
 });
+
+test("list: returns registered envs with live state and excludes destroyed/destroying ones", async () => {
+  const entries = ["pr-1", "pr-2", "pr-3", "pr-4", "pr-5", "pr-6"].map((envId, i) => ({
+    envId,
+    imageIdentifier: `img-${envId}`,
+    registeredAt: 1_700_000_000_000 + i,
+    updatedAt: 1_700_000_100_000 + i,
+    revision: 1,
+  }));
+  const statuses = {
+    "pr-1": { registered: true, booting: false, microvmId: "vm-1", imageIdentifier: "img-pr-1", imageVersion: "3" },
+    "pr-2": { registered: true, booting: true },
+    "pr-6": { registered: true, booting: false, microvmId: "vm-6", expiresAt: new Date(Date.now() - 1000).toISOString() },
+    "pr-3": { registered: false, booting: false }, // destroyed → pruned
+    "pr-4": { registered: false, booting: false, cleanupPending: { microvmIds: ["vm-4"], imageIdentifiers: [] } }, // destroying
+  };
+  const removed = [];
+  const { env } = createEnv();
+  env.PREVIEW_DO = {
+    idFromName: (name) => name,
+    get: (id) => ({
+      async getStatus() {
+        if (id === "pr-5") throw new Error("boom");
+        return statuses[id];
+      },
+    }),
+  };
+  env.ENV_REGISTRY = {
+    idFromName: (name) => name,
+    get: () => ({
+      async list() {
+        return entries;
+      },
+      async remove(envId) {
+        removed.push(envId);
+        return true;
+      },
+    }),
+  };
+
+  const res = await worker.fetch(api("/api/envs"), env);
+  assert.equal(res.status, 200);
+  const { envs } = await res.json();
+  assert.deepEqual(
+    envs.map((e) => [e.envId, e.state]),
+    [
+      ["pr-1", "running"],
+      ["pr-2", "booting"],
+      ["pr-5", "unavailable"],
+      ["pr-6", "idle"],
+    ]
+  );
+  assert.equal(envs[0].url, "https://pr-1.preview.example.com/");
+  assert.equal(envs[0].imageVersion, "3");
+  assert.equal(envs[0].registeredAt, new Date(1_700_000_000_000).toISOString());
+  assert.equal(envs[2].imageIdentifier, "img-pr-5");
+  assert.deepEqual(removed, ["pr-3"]);
+});
+
+test("list: requires the CI secret", async () => {
+  const { env } = createEnv();
+  const res = await worker.fetch(new Request("https://api.preview.example.com/api/envs"), env);
+  assert.equal(res.status, 401);
+  assert.equal((await worker.fetch(api("/api/envs"), env)).status, 200);
+});
