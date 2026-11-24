@@ -104,18 +104,20 @@ async function findAccessJwk(teamDomain: string, kid: string | undefined): Promi
 }
 
 /**
- * Verify Cloudflare Access JWT (CF-Access-Jwt-Assertion) when both CF_ACCESS_TEAM_DOMAIN
- * and CF_ACCESS_AUD are set. Passes through if neither is set; fails closed (500) if only one is set.
+ * Verify Cloudflare Access JWT (CF-Access-Jwt-Assertion) on previews when CF_ACCESS_AUD is set.
+ * Passes through when CF_ACCESS_AUD is unset, even if CF_ACCESS_TEAM_DOMAIN is set for the Admin UI;
+ * fails closed (500) when CF_ACCESS_AUD is set without CF_ACCESS_TEAM_DOMAIN.
  */
 export async function verifyPreviewAccess(
   request: Request,
   env: Pick<Env, "CF_ACCESS_TEAM_DOMAIN" | "CF_ACCESS_AUD">
 ): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
-  if (!env.CF_ACCESS_TEAM_DOMAIN && !env.CF_ACCESS_AUD) {
+  // CF_ACCESS_TEAM_DOMAIN is shared with the Admin UI, so only CF_ACCESS_AUD opts previews into Access.
+  if (!env.CF_ACCESS_AUD) {
     return { ok: true };
   }
-  if (!env.CF_ACCESS_TEAM_DOMAIN || !env.CF_ACCESS_AUD) {
-    console.error("[auth] Both CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set to enable Cloudflare Access verification");
+  if (!env.CF_ACCESS_TEAM_DOMAIN) {
+    console.error("[auth] CF_ACCESS_TEAM_DOMAIN must be set when CF_ACCESS_AUD is set");
     return { ok: false, status: 500, message: "Cloudflare Access verification is misconfigured" };
   }
 
