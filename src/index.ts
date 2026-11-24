@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { adminApp, ENV_ID_REGEX, registryStub } from "./admin";
+import { adminApp, ENV_ID_REGEX, envState, loadEnvs, previewUrl, registryStub } from "./admin";
 import { verifyCiSecret, verifyPreviewAccess } from "./auth";
 import { PreviewEnvironmentDO } from "./preview-do";
 import { EnvRegistryDO } from "./registry-do";
@@ -55,6 +55,37 @@ apiApp.use("*", async (c, next) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
   await next();
+});
+
+const iso = (ms?: number) => (ms === undefined ? undefined : new Date(ms).toISOString());
+
+/**
+ * List registered environments with live status (destroyed / destroying ones are excluded).
+ * Environments whose status could not be read are kept with state "unavailable"
+ * so callers such as cleanup jobs don't silently miss them.
+ */
+apiApp.get("/api/envs", async (c) => {
+  const rows = await loadEnvs(c.env);
+  const envs = rows.flatMap(({ entry, status }) => {
+    const state = envState(status);
+    if (state === "destroying") return [];
+    return [
+      {
+        envId: entry.envId,
+        state,
+        url: previewUrl(c.req.url, entry.envId, c.env),
+        imageIdentifier: status?.imageIdentifier ?? entry.imageIdentifier,
+        imageVersion: status?.imageVersion,
+        microvmId: status?.microvmId,
+        registeredAt: iso(entry.registeredAt),
+        updatedAt: iso(entry.updatedAt),
+        createdAt: status?.createdAt,
+        expiresAt: status?.expiresAt,
+        cleanupPending: status?.cleanupPending,
+      },
+    ];
+  });
+  return c.json({ envs });
 });
 
 apiApp.use("/api/envs/:envId/:action", async (c, next) => {

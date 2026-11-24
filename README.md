@@ -48,7 +48,7 @@ npm run dev
 `.dev.vars` sets `API_HOSTNAME=api.localhost` and `PREVIEW_BASE_DOMAIN=localhost`, overriding `wrangler.jsonc`:
 
 - **Admin UI**: `http://api.localhost:8787/admin` (Access verification is bypassed on `localhost`)
-- **Management API**: `http://api.localhost:8787/api/envs/:envId/*`
+- **Management API**: `http://api.localhost:8787/api/envs` and `/api/envs/:envId/*`
 - **Preview URL**: `http://<envId>.localhost:8787`
 
 You can test image registration, status inspection, and the Admin UI with the dummy AWS credentials in `.dev.vars.example`. Real AWS credentials are required to actually boot MicroVMs.
@@ -151,7 +151,37 @@ npm run deploy
 
 ## Management API
 
-All `/api/envs/:envId/*` endpoints require the `X-CI-Secret` header. `:envId` must be a valid DNS label (lowercase alphanumeric and hyphens, 1–63 characters).
+All `/api/envs` endpoints require the `X-CI-Secret` header. `:envId` must be a valid DNS label (lowercase alphanumeric and hyphens, 1–63 characters).
+
+### List Environments
+
+```bash
+curl "https://api.preview.example.com/api/envs" \
+  -H "X-CI-Secret: $CI_WEBHOOK_SECRET"
+```
+
+Returns registered environments with live status, most recently updated first. Destroyed and destroying environments are excluded.
+
+```json
+{
+  "envs": [
+    {
+      "envId": "pr-123",
+      "state": "running",
+      "url": "https://pr-123.preview.example.com/",
+      "imageIdentifier": "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:pr-123",
+      "imageVersion": "3",
+      "microvmId": "...",
+      "registeredAt": "2026-11-20T01:23:45.000Z",
+      "updatedAt": "2026-11-24T05:00:00.000Z",
+      "createdAt": "2026-11-24T05:01:10.000Z",
+      "expiresAt": "2026-11-24T12:46:10.000Z"
+    }
+  ]
+}
+```
+
+`state` is one of `running`, `booting`, `idle` (registered, no MicroVM yet) or `unavailable` (status could not be read; kept so cleanup jobs don't miss it). `cleanupPending` appears when AWS resources are queued for retry.
 
 ### Register an Image
 

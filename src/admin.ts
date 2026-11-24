@@ -14,7 +14,7 @@ export function registryStub(env: Env) {
   return env.ENV_REGISTRY.get(env.ENV_REGISTRY.idFromName("global"));
 }
 
-interface EnvRow {
+export interface EnvRow {
   entry: RegistryEntry;
   /** Undefined when getStatus failed; kept in the list as unavailable. */
   status?: PreviewStatusResponse;
@@ -26,7 +26,7 @@ interface EnvRow {
  * - Environments with neither registration nor pending cleanup are pruned from the registry,
  *   guarded by revision so a concurrent re-registration is never removed.
  */
-async function loadEnvs(env: Env): Promise<EnvRow[]> {
+export async function loadEnvs(env: Env): Promise<EnvRow[]> {
   const registry = registryStub(env);
   const entries = await registry.list();
   const results = await Promise.allSettled(
@@ -78,12 +78,26 @@ function shortImage(identifier?: string): Markup {
   return html`<code title="${identifier}">${identifier.split(":").pop() ?? identifier}</code>`;
 }
 
+export type EnvState = "unavailable" | "destroying" | "booting" | "running" | "idle";
+
+export function envState(status: PreviewStatusResponse | undefined): EnvState {
+  if (!status) return "unavailable";
+  if (!status.registered) return "destroying";
+  if (status.booting) return "booting";
+  if (status.microvmId) return "running";
+  return "idle";
+}
+
+const BADGES: Record<EnvState, Markup> = {
+  unavailable: html`<span class="badge">Unavailable</span>`,
+  destroying: html`<span class="badge warn">Destroying</span>`,
+  booting: html`<span class="badge info">Booting</span>`,
+  running: html`<span class="badge ok">Running</span>`,
+  idle: html`<span class="badge">Idle</span>`,
+};
+
 function stateBadge(status: PreviewStatusResponse | undefined): Markup {
-  if (!status) return html`<span class="badge">Unavailable</span>`;
-  if (!status.registered) return html`<span class="badge warn">Destroying</span>`;
-  if (status.booting) return html`<span class="badge info">Booting</span>`;
-  if (status.microvmId) return html`<span class="badge ok">Running</span>`;
-  return html`<span class="badge">Idle</span>`;
+  return BADGES[envState(status)];
 }
 
 function layout(title: string, body: Markup, notice?: string): Markup {
