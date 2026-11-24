@@ -92,10 +92,11 @@ test("rate-limits forced JWKS refreshes for unknown kids", async () => {
   assert.ok(jwksFetches <= before + 1);
 });
 
-test("passes through when both Access vars are unset, fails closed (500) when only one is set", async () => {
+test("passes through when CF_ACCESS_AUD is unset, fails closed (500) when it is set without the team domain", async () => {
   assert.deepEqual(await verify(null, {}), { ok: true });
+  // CF_ACCESS_TEAM_DOMAIN alone is used for the Admin UI and must not lock out unprotected previews
+  assert.deepEqual(await verify(null, { CF_ACCESS_TEAM_DOMAIN: TEAM }), { ok: true });
   assert.equal((await verify("garbage", { CF_ACCESS_AUD: AUD })).status, 500);
-  assert.equal((await verify("garbage", { CF_ACCESS_TEAM_DOMAIN: TEAM })).status, 500);
 });
 
 test("allows retry on next request if forced JWKS refresh fails", async (t) => {
